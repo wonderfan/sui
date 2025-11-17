@@ -43,7 +43,6 @@ The `sui-types` directory is lean and focused, typical of a types-only library:
   - **storage/**: Checkpoint and backcompat types (e.g., `Checkpoint`).
   - **balance/**: Coin and balance primitives (e.g., `Balance`).
   - **witness/**: Upgrade witnesses for protocol evolution.
-  - **parser/**: Utilities for parsing addresses, types, and ABNF specs.
   - **utils/**: Helpers like randomness and hashing.
   - Other files: `lib.rs` (re-exports), `error.rs` (custom errors like `ParseObjectIDError`), `constants.rs` (protocol params, e.g., `SUI_MAX_GAS_BUDGET`), and tests/integration files.
 
@@ -79,7 +78,6 @@ Based on the docs.rs index and source, here are the top-level modules and stando
 | **events** | `SuiEvent`, `EventID` | Emission: `SuiEvent { timestamp_ms, type_: StructTag, parsed_json: Value, bcs: Vec<u8> }`. For indexing off-chain. |
 | **balance** | `Balance<S>` (generic over coin type) | Token math: `Balance { value: u64 }` with add/sub/zero methods. Integrates with `sui-framework`'s coin module. |
 | **storage** | `Checkpoint`, `CheckpointDigest` | Ledger: `Checkpoint { epoch, sequence_number, timestamp_ms, ... }` for finalized state snapshots. |
-| **parser** | `parse_sui_address`, `parse_sui_struct_tag` | Utils: ABNF-based parsers for addresses (`0x...`), type tags (e.g., `0x2::coin::COIN<T>`), and module IDs. Ensures strict validation. |
 
 Traits like `Display` and `PartialEq` are derived for most types. Macros (e.g., for enum variants) aid serialization.
 
