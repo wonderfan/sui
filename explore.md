@@ -263,8 +263,65 @@ Notes
 
 ---
 
-## Cross-cutting notes & how to use this file
+## Design Principles & Architecture Patterns
 
-- When exploring implementations, start with `crates/sui-types` to understand canonical formats used by other crates.
-- Follow runtime wiring from `crates/sui-node` to see how configuration, networking, consensus, and `sui-core` are composed.
-- For storage designs and troubleshooting, examine `crates/sui-storage` and DB column-family layouts.
+This project follows a set of consistent design principles and architectural patterns across `crates/sui-types`, `crates/sui-core`, `crates/sui-node`, `crates/sui-storage`, and `crates/sui-network`. The list below distills those cross-cutting choices so you can reason about trade-offs, extend the system, and maintain compatibility.
+
+- **Modularity & strong crate boundaries:**
+	- **Single responsibility per crate:** each crate focuses on a narrow layer (types, runtime/authority, node wiring, storage, networking). This keeps APIs small and reviewable and enables parallel development.
+	- **Public API surface minimization:** crates export a compact set of types and helpers; internal modules and test helpers remain private.
+
+- **Composition over duplication:**
+	- Reuse of small, well-defined crates (e.g., `sui-types` for canonical types, `sui-storage` for persistence) avoids duplication and centralizes compatibility guarantees.
+	- Higher-level components (like `sui-node`) compose lower-level pieces rather than bake logic into a single binary.
+
+- **Deterministic execution & canonical serialization:**
+	- Canonical binary formats (BCS) and well-defined hashing/digest functions are used everywhere a cross-node agreement or on-disk reproducibility matters.
+	- Move interop respects `move-core-types` encodings and `move-binary-format` semantics so VM behavior is consistent across environments.
+
+- **Object-centric concurrency model:**
+	- The runtime centers on objects with IDs, versions, owners, and digests. Scheduling, locking, and parallel execution are object-scoped to maximize concurrency while preserving deterministic outcomes.
+
+- **Authority vs consensus separation (adapter pattern):**
+	- `sui-core` exposes authority logic and a `ConsensusAdapter` layer that translates consensus-ordered inputs into local actions. This separation enables the same runtime to be driven by different consensus implementations or test harnesses.
+
+- **Checkpointing & global-state roots:**
+	- Checkpoints are first-class: code to assemble, hash, sign, and verify checkpoint artifacts lives in `sui-core` and `sui-types`. Storage and networking crates handle efficient blob transfer and verification.
+	- Global-state hashing utilities and accumulator roots provide compact, auditable snapshots used by state-sync and verification.
+
+- **Pluggable persistence & typed stores:**
+	- Storage abstractions (key-value, object store, blob formats) are pluggable and wrapped with typed-store helpers where possible to get compile-time schema checks and metrics.
+	- Storage focuses on both fast point-reads (RPC/indexers) and efficient batched writes (checkpoints/epoch writes).
+
+- **Network design: protocol layering and defaults:**
+	- `sui-network` wraps a lower-level transport stack (`anemo`/`mysten-network`) and provides Sui-specific protocols (discovery, validator RPCs, state sync).
+	- Sensible network defaults (timeouts, keepalive, request timeouts) are centralized and reused to ensure consistent behaviors across services.
+
+- **Security & cryptography-first design:**
+	- Authentication, signature verification, replay protection, and multisig/legacy-sig compatibility are core concerns implemented in `sui-types` and exercised by `sui-core` and `sui-network`.
+	- Secrets and keys are treated as operational concerns (in `sui-config`), and node code avoids embedding private secrets in repos.
+
+- **Observability & operational readiness:**
+	- All crates expose metrics, structured tracing, and health/admin surfaces. `sui-node` wires Prometheus metrics and tracing layers by default.
+	- Benchmarks, examples, and diagnostic endpoints are included to reason about performance and operational issues.
+
+- **Backpressure, throttling & resource safety:**
+	- The runtime includes mechanisms for backpressure (queue monitors, submission throttles), execution caches and limits, and explicit guards to avoid resource exhaustion under load.
+
+- **Test-first design and rich test harnesses:**
+	- Mock components (mock consensus, mock checkpoint builders), unit tests under `unit_tests/`, and simulator-specific wiring (`cfg(msim)`) make it straightforward to exercise distributed behaviors locally.
+	- Deterministic test utilities (in-memory stores, injected randomness hooks) speed up unit and integration testing.
+
+- **Compatibility, versioning & migration patterns:**
+	- Types and wire formats are treated as long-lived compatibility surfaces; changes must be accompanied by migration helpers or version-gating via protocol config.
+	- Support for legacy encodings and `*_legacy` modules allow gradual rollouts and backwards compatibility.
+
+- **Developer ergonomics via workspace & codegen:**
+	- The monorepo workspace centralizes dependencies and versions to avoid rippling upgrades across crates.
+	- Generated code (gRPC/prost, move bindings) is produced via crate-local build scripts to keep source-of-truth IDLs near their consumers.
+
+- **Error handling & clarity of failure modes:**
+	- Crates use typed error enums (with `thiserror`) where callers need to react to specific failures, and use `anyhow`/`eyre` in higher-level orchestration for ergonomic propagation of errors.
+
+- **Incremental deployability & safety gates:**
+	- Epoch-based configuration, `SupportedProtocolVersions`, and on-chain governance-sensitive knobs are used to coordinate upgrades across validators and clients.
