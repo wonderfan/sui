@@ -110,94 +110,165 @@ Notes
 
 ## `crates/sui-core`
 
-Purpose
-- Implement the runtime semantics: transaction validation, scheduling, Move VM execution, and application of write-sets to authoritative state.
+**Purpose**
+- Implements the Sui authority runtime: transaction ingestion, validation, scheduling, Move VM execution, and application of write-sets to authoritative state.
 
-Major subsystems
-- Executor / VM integration: load packages and execute transaction payloads in a deterministic configuration of the Move VM; return effects (write-sets, events), gas usage, and VM status.
-- Authority / State manager: apply committed write-sets to the object state, update sequence numbers/versions, and produce new object digests.
-- Scheduler: arrange transactions for execution, enforce object-level dependency ordering, and coordinate parallelism while preventing conflicting writes.
-- Gas and Fee logic: compute gas, validate payer balance, and handle fee distribution bookkeeping.
+**High-level summary**
+- `sui-core` contains the core server-side logic an authority node needs to accept, order, execute, and commit transactions. It bridges consensus inputs to state changes by providing Authority state, consensus adapters, transaction orchestration, scheduler/executor, checkpointing, and storage wiring.
+- The crate is intentionally modular: distinct components handle consensus integration, scheduling, execution caching, verification, and checkpointing so other crates (notably `sui-node`) can compose them.
 
-Typical transaction lifecycle
-1. Ingest: transaction arrives (RPC or from consensus). Parse into typed `Transaction` and validate signatures.
-2. Preliminary checks: format, nonce/sequence, basic gas/balance checks, and object existence checks.
-3. Scheduling: place transaction into a scheduler that groups non-conflicting transactions for parallel execution.
-4. Execution: the Move VM executes transaction; result is a write-set and events.
-5. Commit: state manager applies write-set atomically to storage and advances object versions.
+**What’s in the crate (concise modules list)**
+- `authority`, `authority_aggregator`, `authority_client`, `authority_server` — Authority state and RPC/validator-facing server pieces.
+- `consensus_adapter`, `consensus_handler`, `consensus_manager`, `consensus_validator` — Adapters and glue to the consensus layer.
+- `execution_scheduler`, `execution_cache`, `execution_driver`, `transaction_orchestrator`, `transaction_driver` — Scheduling and execution orchestration for parallel, deterministic execution.
+- `checkpoints`, `db_checkpoint_handler`, `mock_checkpoint_builder` — Checkpoint construction, verification, and helpers for testing.
+- `quorum_driver` — High-level API to submit transactions and wait for finality.
+- `storage`, `rpc_index`, `jsonrpc_index`, `global_state_hasher` — Storage integration, indices and global-state hashing used by checkpointing.
+- `signature_verifier`, `module_cache_metrics`, `metrics` — Verification and observability helpers.
+- `runtime`, `validator_tx_finalizer`, `authority_aggregator` — Runtime glue to finalize transactions and manage per-epoch authority components.
 
-Integration points
-- `sui-node`/consensus provides ordered inputs (certificates or batches) and `sui-core` applies them.
-- `sui-storage` persists the results; indexers and RPC surfaces read the stored state/events.
+**Cargo / features (source-driven)**
+- Package: `name = "sui-core"`, `version = "0.1.0"`, `edition = "2024"` (see `crates/sui-core/Cargo.toml`).
+- Heavy workspace dependency usage: Move toolchain crates, `fastcrypto`, `mysten-network`, `typed-store`, `tokio`, `tracing`, and many internal Sui crates.
+- Benchmarks and examples: `verified_cert_cache_bench`, `batch_verification_bench`, and `generate-format` example are declared.
 
-Determinism
-- Execution must be deterministic across validators; canonical encodings and consistent VM configuration are critical.
+**Notable helpers & structure (from `src/lib.rs`)**
+- The crate exposes a wide set of modules for authority lifecycle management and testing utilities under `src/` (see the module list in `lib.rs`).
+- Unit test harnesses live under `src/unit_tests/` and many test helpers (e.g., `mock_checkpoint_builder`, `mock_consensus`) are included for integration tests.
+
+**Key types and responsibilities (practical view)**
+- Authority state: `AuthorityState` and `AuthorityStore` encapsulate persistent state, object application, and per-epoch metadata.
+- Transaction flow: `TransactionOrchestrator`, `TransactionDriver`, and `ExecutionScheduler` are responsible for ordering, scheduling non-conflicting transactions, driving execution, and collecting `TransactionEffects`.
+- Consensus integration: `ConsensusAdapter` and `ConsensusHandler` accept ordered inputs, adapt them for local execution, and connect checkpoint submission to consensus.
+- Checkpointing: modules build and verify checkpoints, compute global state hashes (`global_state_hasher`), and coordinate checkpoint submission.
+
+**Tests & developer utilities**
+- Extensive unit and integration test helpers under `src/unit_tests`, plus mock components to run local consensus/authority tests.
+- Example and bench targets help profile verification and batching behavior.
+
+**How other crates use it**
+- `sui-node` composes `sui-core` to run an authority process (consensus client, executor, checkpoint services). `sui-storage` is used by `sui-core` for persistence, and `sui-json-rpc` and indexers read the artifacts produced by `sui-core`.
 
 ---
+
 
 ## `crates/sui-node`
 
-Purpose
-- Wire together the complete node: configuration, storage, network, consensus client, execution/authority, and operational tooling (metrics, health, admin).
+**Purpose**
+- Process wiring and orchestration for a full Sui node: configuration, networking, consensus client, authority runtime, RPC servers, background tasks and observability.
 
-Primary responsibilities
-- Process initialization: load config, keys, DBs, and initialize subcomponents.
-- Service orchestration: start network listeners, RPC servers, consensus participation, and background tasks.
-- Lifecycle management: graceful shutdown, state snapshotting, and recovery from checkpoints.
+**High-level summary**
+- `sui-node` is the binary-level composition layer that instantiates `sui-core` components, network services (`sui-network`), JSON-RPC/gRPC endpoints, checkpointing, and housekeeping (DB checkpoints, admin APIs, telemetry). It focuses on lifecycle management and operational concerns rather than execution logic.
 
-Common components
-- Networking stack from `sui-network` for peer communication.
-- Consensus client or adaptor that talks to the consensus crate/implementation.
-- Local instance of `sui-core` to validate and apply transactions when acting as an authority.
+**What’s in the crate (concise modules list)**
+- `lib.rs` and `main.rs` — node entrypoint, `SuiNode` struct and `start` lifecycle functions.
+- `admin` — admin & debugging endpoints.
+- `handle` — `SuiNodeHandle` and programmatic control surfaces.
+- `metrics` — node-level metrics registration and collection.
+- HTTP & RPC wiring (JSON-RPC, gRPC) plus integration with `sui-core`'s authority components.
 
-Startup and recovery
-- Nodes typically resume from the latest persisted checkpoint and re-sync with peers if lagging. The node must ensure idempotent application of committed write-sets.
+**Cargo / features (source-driven)**
+- Package: `name = "sui-node"`, `version.workspace = true`, `edition = "2024"` (see `crates/sui-node/Cargo.toml`).
+- Depends on `anemo`, `axum`, `tokio`, `sui-core`, `sui-network`, `sui-storage`, `sui-config`, `sui-json-rpc` and many telemetry/metrics crates.
+- Feature flags: `jemalloc` is enabled by default in the crate features (can be toggled).
 
-Operational concerns
-- Observability: logs, metrics, and trace correlation are configured at startup; admin endpoints allow live health checks and debugging.
-- Resource management: ensure DB caches, thread pools, and network limits are tuned for the deployment.
+**Notable constants & helpers (from `src/lib.rs`)**
+- `DEFAULT_GRPC_CONNECT_TIMEOUT` — default connection timeout used by gRPC clients.
+- `SuiNode` struct encapsulates validator components and P2P components, and exposes `start` helper to bootstrap the node with a `NodeConfig`.
+- The node wires: consensus adapter, checkpoint executor, randomness, discovery, state-sync, and RPC servers.
+
+**Key responsibilities (practical view)**
+- Lifecycle: initialize DBs, load genesis/state, start consensus client (or connect to consensus), start RPC servers, and run background tasks (checkpoint submission, state-sync).
+- Orchestration: construct `AuthorityAggregator`, `ConsensusAdapter`, `CheckpointStore`, and service components; handle graceful shutdown and epoch transitions.
+- Observability: configure metrics, tracing, admin endpoints and runtime diagnostics.
+
+**Tests & developer utilities**
+- `main.rs` provides the normal binary entry; `lib.rs` exposes an API to programmatically start/stop nodes for integration tests and simulator environments.
+- Simulation-specific wiring (cfg(msim)) enables testing under the Sui simulator with mock JWK injectors and other test hooks.
+
+**How other crates use it**
+- Operators and integration tests run `sui-node` to start a full node process. `sui-node` composes `sui-core`, `sui-network`, `sui-storage` and `sui-json-rpc` to present a single runnable artifact.
 
 ---
+
+---
+
 
 ## `crates/sui-storage`
 
-Purpose
-- Provide durable, high-performance storage for objects, transactions, events, checkpoints, and indices needed by RPC/indexing surfaces.
+**Purpose**
+- Durable storage primitives and helpers used by the node and indexers: file/blob helpers, object/package stores, key-value interfaces, and checkpoint artifact management.
 
-Core components
-- Object Store: maps `(ObjectID, Version)` to an `Object` payload (Move state, metadata, owner).
-- Transaction / Effects Store: stores transactions and their execution effects, events, and gas usage.
-- Checkpoint Store: stores checkpoint metadata, certificates, and associated state digests.
+**High-level summary**
+- `sui-storage` provides both low-level file/blob utilities and higher-level key-value/object store abstractions used to persist checkpoints, packages, objects, and transaction-related artifacts. It includes helpers for checksums, compression, and streaming large checkpoint blobs.
 
-Storage layout
-- Typically backed by an LSM-store (RocksDB) using column families to separate objects, indices, and metadata for efficient targeted reads and compactions.
+**What’s in the crate (concise modules list)**
+- `blob` — file/blob iterator and helpers for reading archived checkpoint blobs.
+- `object_store`, `package_object_cache` — object-level caches and on-disk object helpers.
+- `key_value_store`, `http_key_value_store` — pluggable key-value store interfaces and HTTP-backed store adapters.
+- `write_path_pending_tx_log`, `mutex_table`, `sharded_lru` — write-path and caching primitives.
 
-Access patterns
-- Read-heavy workloads (RPC, indexers): requires fast point-lookup and range scan semantics.
-- Write bursts: applying an epoch or checkpoint can cause large batches of writes; batching and WAL ensure durability.
+**Cargo / features (source-driven)**
+- Package: `name = "sui-storage"`, `version = "0.1.0"`, `edition = "2024"` (see `crates/sui-storage/Cargo.toml`).
+- Depends on `object_store`, `typed-store`, `bcs`, `zstd`, `tokio`, and `sui-types` among others.
 
-Maintenance
-- Compaction and GC policies are important for long-term storage costs; checkpoint archiving is used to keep recent data fast while cold data can be archived.
+**Notable constants & helpers (from `src/lib.rs`)**
+- `SHA3_BYTES` — constant for SHA3-256 digest size (32 bytes).
+- Checksum helpers: `compute_sha3_checksum`, `compute_sha3_checksum_for_bytes`, `compute_sha3_checksum_for_file`.
+- Compression helpers: `FileCompression` enum with `zstd` compress/decompress utilities and `compress`/`decompress` helper functions; generic `compress`/`read` utilities for blob formats.
+- Checkpoint verification helpers: `verify_checkpoint`, `verify_checkpoint_with_committee`, and `verify_checkpoint_range` which validate checkpoint summaries against committee signatures.
+
+**Key responsibilities (practical view)**
+- Persisting large artifacts: efficient read/write streaming for checkpoint blobs and package artifacts.
+- Object & package persistence: key-value interfaces and object caches used by higher-level services.
+- Data integrity: checksum and compression utilities to ensure on-disk integrity and to support archive formats.
+
+**Tests & developer utilities**
+- Includes test helpers and dev features for in-memory stores and simulation testing; dev-dependencies include `sui-test-transaction-builder` and `sui-simulator`.
+
+**How other crates use it**
+- `sui-core` and `sui-node` use `sui-storage` for persistent storage of objects, transactions, and checkpoint artifacts. Indexers and archival tooling also consume the blob and key-value helpers here.
 
 ---
 
+---
+
+
 ## `crates/sui-network`
 
-Purpose
-- Provide networking primitives (transport, RPC handlers, gossip) used by nodes and services for transaction propagation, state sync, and consensus messaging.
+**Purpose**
+- Networking primitives and transport glue used by Sui nodes and services for P2P RPC, discovery, state-sync, randomness distribution, and validator APIs.
 
-Major responsibilities
-- Transport layer: connection lifecycle, multiplexing, TLS/authentication, and optional QUIC/TCP abstraction.
-- RPC endpoints: request/response handlers used by peers and clients for transaction submission, object queries, and state sync.
-- Gossip/PubSub: broadcast mechanisms for propagating transactions and other ephemeral messages.
+**High-level summary**
+- `sui-network` wraps lower-level transport libraries (notably `anemo` / `mysten-network`) and provides Sui-specific protocols: discovery, validator server/client APIs, state sync, randomness distribution, and helper defaults for network tuning.
 
-Common flows
-- Transaction propagation: clients submit to a node → node gossips to validators and peers using pubsub/gossip protocols.
-- State sync: lagging node requests checkpoint artifacts or object ranges from peers and replays to catch up.
+**What’s in the crate (concise modules list)**
+- `api` — network API definitions and request/response types.
+- `discovery` — peer discovery and trusted-peer management.
+- `randomness` — randomness distribution utilities and shims used by consensus/epoch flows.
+- `state_sync` — state-sync protocol implementations for fetching checkpoint and object artifacts.
+- `validator` — validator-specific server/client bindings and the `ServerBuilder` convenience.
 
-Operational concerns
-- Security: authenticated channels and replay protection; rate limiting and backpressure protect against abuse.
-- Performance: batching, prioritized message queues, and connection pooling are used to maximize throughput.
+**Cargo / features (source-driven)**
+- Package: `name = "sui-network"`, `edition = "2024"` (see `crates/sui-network/Cargo.toml`).
+- Depends on `anemo`, `mysten-network`, `tonic`, `tokio`, `shared-crypto`, `sui-types`, and `sui-storage`.
+- Build dependencies include `anemo-build` and `tonic-build` for protocol codegen.
+
+**Notable constants & helpers (from `src/lib.rs`)**
+- `DEFAULT_CONNECT_TIMEOUT_SEC`, `DEFAULT_REQUEST_TIMEOUT_SEC`, `DEFAULT_HTTP2_KEEPALIVE_SEC` — network timing defaults.
+- `default_mysten_network_config()` — returns a `mysten_network::config::Config` instance pre-populated with sensible defaults tuned by the crate.
+
+**Key responsibilities (practical view)**
+- Transport & RPC: provide robust, authenticated RPC and streaming transports for validator-to-validator and client-to-validator communication.
+- Discovery & state sync: maintain trusted-peer lists and provide the state-sync protocol to fetch checkpoint artifacts and object ranges.
+- Validator APIs: provide server implementations (`validator::server::ServerBuilder`) used by `sui-node` to expose validator endpoints.
+
+**Tests & developer utilities**
+- Includes test harnesses and dev-dependencies for simulated networking and protocol tests; `build.rs` helps codegen for gRPC/Prost where needed.
+
+**How other crates use it**
+- `sui-node` depends on `sui-network` to provide P2P networking, discovery, state-sync and validator RPC servers; `sui-core` and the consensus adapters interact through the network APIs exposed here.
+
 
 ---
 
