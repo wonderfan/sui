@@ -116,7 +116,7 @@ Notes
 - `sui-core` contains the core server-side logic an authority node needs to accept, order, execute, and commit transactions. It bridges consensus inputs to state changes by providing Authority state, consensus adapters, transaction orchestration, scheduler/executor, checkpointing, and storage wiring.
 - The crate is intentionally modular: distinct components handle consensus integration, scheduling, execution caching, verification, and checkpointing so other crates (notably `sui-node`) can compose them.
 
-**What’s in the crate (concise modules list)**
+**What’s in the crate**
 - `authority`, `authority_aggregator`, `authority_client`, `authority_server` — Authority state and RPC/validator-facing server pieces.
 - `consensus_adapter`, `consensus_handler`, `consensus_manager`, `consensus_validator` — Adapters and glue to the consensus layer.
 - `execution_scheduler`, `execution_cache`, `execution_driver`, `transaction_orchestrator`, `transaction_driver` — Scheduling and execution orchestration for parallel, deterministic execution.
@@ -126,7 +126,7 @@ Notes
 - `signature_verifier`, `module_cache_metrics`, `metrics` — Verification and observability helpers.
 - `runtime`, `validator_tx_finalizer`, `authority_aggregator` — Runtime glue to finalize transactions and manage per-epoch authority components.
 
-**Cargo / features (source-driven)**
+**Cargo / features**
 - Package: `name = "sui-core"`, `version = "0.1.0"`, `edition = "2024"` (see `crates/sui-core/Cargo.toml`).
 - Heavy workspace dependency usage: Move toolchain crates, `fastcrypto`, `mysten-network`, `typed-store`, `tokio`, `tracing`, and many internal Sui crates.
 - Benchmarks and examples: `verified_cert_cache_bench`, `batch_verification_bench`, and `generate-format` example are declared.
@@ -135,7 +135,7 @@ Notes
 - The crate exposes a wide set of modules for authority lifecycle management and testing utilities under `src/` (see the module list in `lib.rs`).
 - Unit test harnesses live under `src/unit_tests/` and many test helpers (e.g., `mock_checkpoint_builder`, `mock_consensus`) are included for integration tests.
 
-**Key types and responsibilities (practical view)**
+**Key types and responsibilities**
 - Authority state: `AuthorityState` and `AuthorityStore` encapsulate persistent state, object application, and per-epoch metadata.
 - Transaction flow: `TransactionOrchestrator`, `TransactionDriver`, and `ExecutionScheduler` are responsible for ordering, scheduling non-conflicting transactions, driving execution, and collecting `TransactionEffects`.
 - Consensus integration: `ConsensusAdapter` and `ConsensusHandler` accept ordered inputs, adapt them for local execution, and connect checkpoint submission to consensus.
@@ -158,14 +158,14 @@ Notes
 **High-level summary**
 - `sui-node` is the binary-level composition layer that instantiates `sui-core` components, network services (`sui-network`), JSON-RPC/gRPC endpoints, checkpointing, and housekeeping (DB checkpoints, admin APIs, telemetry). It focuses on lifecycle management and operational concerns rather than execution logic.
 
-**What’s in the crate (concise modules list)**
+**What’s in the crate**
 - `lib.rs` and `main.rs` — node entrypoint, `SuiNode` struct and `start` lifecycle functions.
 - `admin` — admin & debugging endpoints.
 - `handle` — `SuiNodeHandle` and programmatic control surfaces.
 - `metrics` — node-level metrics registration and collection.
 - HTTP & RPC wiring (JSON-RPC, gRPC) plus integration with `sui-core`'s authority components.
 
-**Cargo / features (source-driven)**
+**Cargo / features**
 - Package: `name = "sui-node"`, `version.workspace = true`, `edition = "2024"` (see `crates/sui-node/Cargo.toml`).
 - Depends on `anemo`, `axum`, `tokio`, `sui-core`, `sui-network`, `sui-storage`, `sui-config`, `sui-json-rpc` and many telemetry/metrics crates.
 - Feature flags: `jemalloc` is enabled by default in the crate features (can be toggled).
@@ -175,7 +175,7 @@ Notes
 - `SuiNode` struct encapsulates validator components and P2P components, and exposes `start` helper to bootstrap the node with a `NodeConfig`.
 - The node wires: consensus adapter, checkpoint executor, randomness, discovery, state-sync, and RPC servers.
 
-**Key responsibilities (practical view)**
+**Key responsibilities**
 - Lifecycle: initialize DBs, load genesis/state, start consensus client (or connect to consensus), start RPC servers, and run background tasks (checkpoint submission, state-sync).
 - Orchestration: construct `AuthorityAggregator`, `ConsensusAdapter`, `CheckpointStore`, and service components; handle graceful shutdown and epoch transitions.
 - Observability: configure metrics, tracing, admin endpoints and runtime diagnostics.
@@ -197,13 +197,13 @@ Notes
 **High-level summary**
 - `sui-storage` provides both low-level file/blob utilities and higher-level key-value/object store abstractions used to persist checkpoints, packages, objects, and transaction-related artifacts. It includes helpers for checksums, compression, and streaming large checkpoint blobs.
 
-**What’s in the crate (concise modules list)**
+**What’s in the crate**
 - `blob` — file/blob iterator and helpers for reading archived checkpoint blobs.
 - `object_store`, `package_object_cache` — object-level caches and on-disk object helpers.
 - `key_value_store`, `http_key_value_store` — pluggable key-value store interfaces and HTTP-backed store adapters.
 - `write_path_pending_tx_log`, `mutex_table`, `sharded_lru` — write-path and caching primitives.
 
-**Cargo / features (source-driven)**
+**Cargo / features**
 - Package: `name = "sui-storage"`, `version = "0.1.0"`, `edition = "2024"` (see `crates/sui-storage/Cargo.toml`).
 - Depends on `object_store`, `typed-store`, `bcs`, `zstd`, `tokio`, and `sui-types` among others.
 
@@ -213,7 +213,7 @@ Notes
 - Compression helpers: `FileCompression` enum with `zstd` compress/decompress utilities and `compress`/`decompress` helper functions; generic `compress`/`read` utilities for blob formats.
 - Checkpoint verification helpers: `verify_checkpoint`, `verify_checkpoint_with_committee`, and `verify_checkpoint_range` which validate checkpoint summaries against committee signatures.
 
-**Key responsibilities (practical view)**
+**Key responsibilities**
 - Persisting large artifacts: efficient read/write streaming for checkpoint blobs and package artifacts.
 - Object & package persistence: key-value interfaces and object caches used by higher-level services.
 - Data integrity: checksum and compression utilities to ensure on-disk integrity and to support archive formats.
@@ -234,14 +234,14 @@ Notes
 **High-level summary**
 - `sui-network` wraps lower-level transport libraries (notably `anemo` / `mysten-network`) and provides Sui-specific protocols: discovery, validator server/client APIs, state sync, randomness distribution, and helper defaults for network tuning.
 
-**What’s in the crate (concise modules list)**
+**What’s in the crate**
 - `api` — network API definitions and request/response types.
 - `discovery` — peer discovery and trusted-peer management.
 - `randomness` — randomness distribution utilities and shims used by consensus/epoch flows.
 - `state_sync` — state-sync protocol implementations for fetching checkpoint and object artifacts.
 - `validator` — validator-specific server/client bindings and the `ServerBuilder` convenience.
 
-**Cargo / features (source-driven)**
+**Cargo / features**
 - Package: `name = "sui-network"`, `edition = "2024"` (see `crates/sui-network/Cargo.toml`).
 - Depends on `anemo`, `mysten-network`, `tonic`, `tokio`, `shared-crypto`, `sui-types`, and `sui-storage`.
 - Build dependencies include `anemo-build` and `tonic-build` for protocol codegen.
