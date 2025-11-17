@@ -15,7 +15,6 @@ Contents
 
 ---
 
-
 ## `crates/sui-types`
 
 **Purpose**
@@ -151,7 +150,6 @@ Notes
 
 ---
 
-
 ## `crates/sui-node`
 
 **Purpose**
@@ -191,9 +189,6 @@ Notes
 
 ---
 
----
-
-
 ## `crates/sui-storage`
 
 **Purpose**
@@ -231,7 +226,6 @@ Notes
 
 ---
 
-
 ## `crates/sui-network`
 
 **Purpose**
@@ -266,7 +260,6 @@ Notes
 
 **How other crates use it**
 - `sui-node` depends on `sui-network` to provide P2P networking, discovery, state-sync and validator RPC servers; `sui-core` and the consensus adapters interact through the network APIs exposed here.
-
 
 ---
 
