@@ -20,6 +20,8 @@ Contents
 Purpose
 - Provide the canonical type system and binary encodings used across Sui: on-chain object models, transaction envelopes, digests, addresses, certificates, and small helper types used for deterministic validation and storage.
 
+The sui-types crate is a foundational pillar of the Sui blockchain's Rust implementation. It defines the core primitives, types, and serialization mechanisms that underpin Sui's object-centric model, transaction processing, and protocol consistency. This crate ensures type safety across the ecosystem, allowing other components (e.g., sui-core, sui-sdk) to interoperate seamlessly without reinventing basic structures. It's designed for high performance, leveraging Rust's zero-cost abstractions, and heavily relies on BCS (Binary Canonical Serialization) for efficient, deterministic encoding/decoding—critical for blockchain consensus and storage.
+
 Major data structures
 - Object / Move Object: id, version/sequence number, owner, Move type tag, BCS-encoded value, and object digest. This is the canonical persisted unit for runtime state.
 - ObjectID / SequenceNumber / ObjectDigest: identifiers and versioning types that make object updates deterministic and comparable across validators.
