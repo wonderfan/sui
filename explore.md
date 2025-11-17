@@ -2,7 +2,7 @@
 
 This document provides a focused, consolidated exploration of the main data structures, logic flows, and architectures for several core Sui crates. It is intended as a developer-oriented map to help you navigate the implementation in `crates/`.
 
-The crates/ folder is the heart of the Rust implementation, with subdirectories representing individual crates. Each typically includes a Cargo.toml for dependencies, src/ for source code, and sometimes examples/ or tests/.
+The `crates/` folder is the heart of the Rust implementation, with subdirectories representing individual crates. Each typically includes a `Cargo.toml` for dependencies, `src/` for source code, and sometimes `benches/` or `tests/`.
 
 Contents
 - `crates/sui-types` — canonical runtime types and encodings
