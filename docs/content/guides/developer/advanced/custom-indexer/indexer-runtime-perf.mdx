@@ -16,7 +16,7 @@ Together, these techniques help you run indexers that are fast, resource-efficie
 
 ## Fine-tuning configurations
 
-The indexing framework provides multiple levels of configuration to optimize performance for different use cases. This section covers basic configuration options, while complex pipeline-specific tuning is covered in [Indexer Pipeline Architecture](/concepts/custom-indexer/pipeline-architecture.mdx).
+The indexing framework provides multiple levels of configuration to optimize performance for different use cases. This section covers basic configuration options, while complex pipeline-specific tuning is covered in [Indexer Pipeline Architecture](/concepts/data-access/pipeline-architecture.mdx).
 
 ### Ingestion layer configuration
 
@@ -26,12 +26,25 @@ Control how checkpoint data is fetched and distributed:
 let ingestion_config = IngestionConfig {
     // Buffer size across all downstream workers (default: 5000)
     checkpoint_buffer_size: 10000,
-    
+
     // Concurrent checkpoint fetches (default: 200)
     ingest_concurrency: 500,
-    
+
     // Retry interval for missing checkpoints in ms (default: 200)
     retry_interval_ms: 100,
+
+    // gRPC streaming configuration (applies when --streaming-url is provided)
+    // Initial batch size after streaming connection failure (default: 10)
+    streaming_backoff_initial_batch_size: 20,
+
+    // Maximum batch size after repeated streaming failures (default: 10000)
+    streaming_backoff_max_batch_size: 20000,
+
+    // Timeout for streaming connection in ms (default: 5000)
+    streaming_connection_timeout_ms: 10000,
+
+    // Timeout for streaming operations (peek/next) in ms (default: 5000)
+    streaming_statement_timeout_ms: 10000,
 };
 ```
 
@@ -40,6 +53,10 @@ let ingestion_config = IngestionConfig {
 - `checkpoint_buffer_size`: Increase for high-throughput scenarios, decrease to reduce memory usage.
 - `ingest_concurrency`: Higher values improve ingestion speed but increase network/storage load.
 - `retry_interval_ms`: Lower values reduce latency for live data, higher values reduce unnecessary retries.
+- `streaming_backoff_initial_batch_size`: Number of checkpoints to process via polling after the initial streaming failure. Lower values restore streaming faster, higher values reduce connection attempts.
+- `streaming_backoff_max_batch_size`: Maximum checkpoints to process via polling after repeated failures. The batch size increases exponentially from the initial size up to this maximum. Higher values reduce connection attempts during prolonged outages.
+- `streaming_connection_timeout_ms`: Time to wait for streaming connection establishment. Increase for slower networks.
+- `streaming_statement_timeout_ms`: Time to wait for streaming data operations. Increase if checkpoints are large or network is slow.
 
 ### Database connection configuration
 
@@ -75,10 +92,6 @@ Include the following command-line arguments to help focus processing. These val
 --pipeline "tx_counts"          # Run specific pipeline only
 --pipeline "events"             # Can specify multiple pipelines
 
-# Watermark behavior
---skip-watermark  
-```
-
 **Use cases:**
 
 - **Checkpoint range:** Essential for backfills and historical data processing.
@@ -89,8 +102,8 @@ Include the following command-line arguments to help focus processing. These val
 
 For complex configuration scenarios requiring deep understanding of pipeline internals:
 
-- [Sequential pipeline architecture](/concepts/custom-indexer/pipeline-architecture.mdx#sequential-pipeline-architecture)
-- [Concurrent pipeline architecture](/concepts/custom-indexer/pipeline-architecture.mdx#concurrent-pipeline-architecture)
+- [Sequential pipeline architecture](/concepts/data-access/pipeline-architecture.mdx#sequential-pipeline-architecture)
+- [Concurrent pipeline architecture](/concepts/data-access/pipeline-architecture.mdx#concurrent-pipeline-architecture)
 
 ## Tokio runtime debugging
 
@@ -354,5 +367,5 @@ WHERE command = 'SELECT run_maintenance()';
 
 ## Related links
 
-<RelatedLink to="/concepts/custom-indexing-framework.mdx" />
+<RelatedLink to="/concepts/data-access/custom-indexing-framework.mdx" />
 <RelatedLink to="/guides/developer/advanced/custom-indexer.mdx" />

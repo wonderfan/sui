@@ -16,6 +16,8 @@ use crate::digests::{AdditionalConsensusStateDigest, CertificateDigest, SenderSi
 use crate::digests::{ChainIdentifier, ConsensusCommitDigest, ZKLoginInputsDigest};
 use crate::execution::{ExecutionTimeObservationKey, SharedInput};
 use crate::gas_coin::GAS;
+use crate::gas_model::gas_predicates::check_for_gas_price_too_high;
+use crate::gas_model::gas_v2::SuiCostTable;
 use crate::message_envelope::{Envelope, Message, TrustedEnvelope, VerifiedEnvelope};
 use crate::messages_checkpoint::CheckpointTimestamp;
 use crate::messages_consensus::{
@@ -42,7 +44,6 @@ use move_core_types::{identifier::Identifier, language_storage::TypeTag};
 use nonempty::{NonEmpty, nonempty};
 use serde::{Deserialize, Serialize};
 use shared_crypto::intent::{Intent, IntentMessage, IntentScope};
-use std::collections::btree_map::Entry;
 use std::fmt::Write;
 use std::fmt::{Debug, Display, Formatter};
 use std::iter::once;
@@ -210,6 +211,13 @@ impl FundsWithdrawalArg {
             reservation: Reservation::MaxAmountU64(amount),
             type_arg: WithdrawalTypeArg::Balance(balance_type),
             withdraw_from: WithdrawFrom::Sponsor,
+        }
+    }
+
+    fn owner_for_withdrawal(&self, tx: &impl TransactionDataAPI) -> SuiAddress {
+        match self.withdraw_from {
+            WithdrawFrom::Sender => tx.sender(),
+            WithdrawFrom::Sponsor => tx.gas_owner(),
         }
     }
 }
@@ -483,6 +491,7 @@ pub enum EndOfEpochTransactionKind {
     AccumulatorRootCreate,
     CoinRegistryCreate,
     DisplayRegistryCreate,
+    AddressAliasStateCreate,
 }
 
 impl EndOfEpochTransactionKind {
@@ -542,6 +551,10 @@ impl EndOfEpochTransactionKind {
         Self::DenyListStateCreate
     }
 
+    pub fn new_address_alias_state_create() -> Self {
+        Self::AddressAliasStateCreate
+    }
+
     pub fn new_bridge_create(chain_identifier: ChainIdentifier) -> Self {
         Self::BridgeStateCreate(chain_identifier)
     }
@@ -598,6 +611,7 @@ impl EndOfEpochTransactionKind {
             Self::AccumulatorRootCreate => vec![],
             Self::CoinRegistryCreate => vec![],
             Self::DisplayRegistryCreate => vec![],
+            Self::AddressAliasStateCreate => vec![],
         }
     }
 
@@ -635,6 +649,7 @@ impl EndOfEpochTransactionKind {
             Self::AccumulatorRootCreate => Either::Right(iter::empty()),
             Self::CoinRegistryCreate => Either::Right(iter::empty()),
             Self::DisplayRegistryCreate => Either::Right(iter::empty()),
+            Self::AddressAliasStateCreate => Either::Right(iter::empty()),
         }
     }
 
@@ -709,6 +724,13 @@ impl EndOfEpochTransactionKind {
                 if !config.enable_display_registry() {
                     return Err(UserInputError::Unsupported(
                         "display registry not enabled".to_string(),
+                    ));
+                }
+            }
+            Self::AddressAliasStateCreate => {
+                if !config.address_aliases() {
+                    return Err(UserInputError::Unsupported(
+                        "address aliases not enabled".to_string(),
                     ));
                 }
             }
@@ -1638,6 +1660,19 @@ impl TransactionKind {
         Ok(input_objects)
     }
 
+    fn get_funds_withdrawals<'a>(&'a self) -> impl Iterator<Item = &'a FundsWithdrawalArg> + 'a {
+        let TransactionKind::ProgrammableTransaction(pt) = &self else {
+            return Either::Left(iter::empty());
+        };
+        Either::Right(pt.inputs.iter().filter_map(|input| {
+            if let CallArg::FundsWithdrawal(withdraw) = input {
+                Some(withdraw)
+            } else {
+                None
+            }
+        }))
+    }
+
     pub fn validity_check(&self, config: &ProtocolConfig) -> UserInputResult {
         match self {
             TransactionKind::ProgrammableTransaction(p) => p.validity_check(config)?,
@@ -1856,9 +1891,9 @@ pub enum TransactionExpiration {
         /// Transaction expires after this epoch. Must equal current epoch
         max_epoch: Option<EpochId>,
         /// Future support for sub-epoch timing (not yet implemented)
-        min_timestamp_seconds: Option<u64>,
+        min_timestamp: Option<u64>,
         /// Future support for sub-epoch timing (not yet implemented)
-        max_timestamp_seconds: Option<u64>,
+        max_timestamp: Option<u64>,
         /// Network identifier to prevent cross-chain replay
         chain: ChainIdentifier,
         /// User-provided uniqueness identifier to differentiate otherwise identical transactions
@@ -2302,7 +2337,7 @@ pub trait TransactionDataAPI {
     fn into_kind(self) -> TransactionKind;
 
     /// Transaction signer and Gas owner
-    fn signers(&self) -> NonEmpty<SuiAddress>;
+    fn required_signers(&self) -> NonEmpty<SuiAddress>;
 
     fn gas_data(&self) -> &GasData;
 
@@ -2335,7 +2370,16 @@ pub trait TransactionDataAPI {
     /// reserved amount. This method aggregates all withdraw operations for the same account by
     /// merging their reservations. Each account object ID is derived from the type parameter of
     /// each withdraw operation.
-    fn process_funds_withdrawals(&self) -> UserInputResult<BTreeMap<AccumulatorObjId, u64>>;
+    ///
+    /// This method is used at signing time, and can reject a transaction if it contains
+    /// invalid reservations.
+    fn process_funds_withdrawals_for_signing(
+        &self,
+    ) -> UserInputResult<BTreeMap<AccumulatorObjId, u64>>;
+
+    /// Like `process_funds_withdrawals_for_signing`, but must only be called on a certified
+    /// transaction, i.e. one that is known to be valid.
+    fn process_funds_withdrawals_for_execution(&self) -> BTreeMap<AccumulatorObjId, u64>;
 
     // A cheap way to quickly check if the transaction has funds withdraws.
     fn has_funds_withdrawals(&self) -> bool;
@@ -2390,7 +2434,7 @@ impl TransactionDataAPI for TransactionDataV1 {
     }
 
     /// Transaction signer and Gas owner
-    fn signers(&self) -> NonEmpty<SuiAddress> {
+    fn required_signers(&self) -> NonEmpty<SuiAddress> {
         let mut signers = nonempty![self.sender];
         if self.gas_owner() != self.sender {
             signers.push(self.gas_owner());
@@ -2468,87 +2512,72 @@ impl TransactionDataAPI for TransactionDataV1 {
         Ok((move_objects, packages, receiving_objects))
     }
 
-    fn process_funds_withdrawals(&self) -> UserInputResult<BTreeMap<AccumulatorObjId, u64>> {
+    fn process_funds_withdrawals_for_signing(
+        &self,
+    ) -> UserInputResult<BTreeMap<AccumulatorObjId, u64>> {
         let mut withdraws = self.get_funds_withdrawals();
 
-        for withdraw in &withdraws {
-            if matches!(withdraw.withdraw_from, WithdrawFrom::Sponsor) {
-                return Err(UserInputError::InvalidWithdrawReservation {
-                    error: "Explicit sponsor withdrawals are not yet supported".to_string(),
-                });
-            }
-        }
-
-        if self.is_gas_paid_from_address_balance() {
-            let gas_withdraw = if self.sender() != self.gas_owner() {
-                FundsWithdrawalArg::balance_from_sponsor(
-                    self.gas_data().budget,
-                    TypeInput::from(GAS::type_tag()),
-                )
-            } else {
-                FundsWithdrawalArg::balance_from_sender(
-                    self.gas_data().budget,
-                    TypeInput::from(GAS::type_tag()),
-                )
-            };
-            withdraws.push(gas_withdraw);
-        }
-
-        // TODO(address-balances): Use a protocol config parameter for max_withdraws.
-        let max_withdraws = 10;
-        if withdraws.len() > max_withdraws {
-            return Err(UserInputError::InvalidWithdrawReservation {
-                error: format!(
-                    "Maximum number of balance withdraw reservations is {max_withdraws}"
-                ),
-            });
-        }
+        withdraws.extend(self.get_funds_withdrawal_for_gas_payment());
 
         // Accumulate all withdraws per account.
-        let mut withdraw_map = BTreeMap::new();
+        let mut withdraw_map: BTreeMap<_, u64> = BTreeMap::new();
         for withdraw in withdraws {
             let reserved_amount = match &withdraw.reservation {
-                Reservation::MaxAmountU64(amount) => *amount,
-                Reservation::EntireBalance => {
-                    return Err(UserInputError::InvalidWithdrawReservation {
-                        error: "Reserving the entire balance is not supported".to_string(),
-                    });
+                Reservation::MaxAmountU64(amount) => {
+                    assert!(*amount > 0, "verified in validity check");
+                    *amount
                 }
+                Reservation::EntireBalance => unreachable!("verified in validity check"),
             };
-            // Reserving an amount of 0 is meaningless, and potentially
-            // add various edge cases, which is error prone.
-            if reserved_amount == 0 {
-                return Err(UserInputError::InvalidWithdrawReservation {
-                    error: "Balance withdraw reservation amount must be non-zero".to_string(),
-                });
-            }
-            let account_address = match withdraw.withdraw_from {
-                WithdrawFrom::Sender => self.sender(),
-                WithdrawFrom::Sponsor => self.gas_owner(),
-            };
+
+            let account_address = withdraw.owner_for_withdrawal(self);
             let account_id =
                 AccumulatorValue::get_field_id(account_address, &withdraw.type_arg.to_type_tag()?)
                     .map_err(|e| UserInputError::InvalidWithdrawReservation {
                         error: e.to_string(),
                     })?;
-            let entry = withdraw_map.entry(account_id);
-            match entry {
-                Entry::Vacant(vacant) => {
-                    vacant.insert(reserved_amount);
-                }
-                Entry::Occupied(mut occupied) => {
-                    let current_amount = *occupied.get();
-                    let new_amount = current_amount.checked_add(reserved_amount).ok_or(
-                        UserInputError::InvalidWithdrawReservation {
-                            error: "Balance withdraw reservation overflow".to_string(),
-                        },
-                    )?;
-                    occupied.insert(new_amount);
-                }
-            }
+
+            let current_amount = withdraw_map.entry(account_id).or_default();
+            *current_amount = current_amount.checked_add(reserved_amount).ok_or(
+                UserInputError::InvalidWithdrawReservation {
+                    error: "Balance withdraw reservation overflow".to_string(),
+                },
+            )?;
         }
 
         Ok(withdraw_map)
+    }
+
+    fn process_funds_withdrawals_for_execution(&self) -> BTreeMap<AccumulatorObjId, u64> {
+        let mut withdraws = self.get_funds_withdrawals();
+        withdraws.extend(self.get_funds_withdrawal_for_gas_payment());
+
+        // Accumulate all withdraws per account.
+        let mut withdraw_map: BTreeMap<AccumulatorObjId, u64> = BTreeMap::new();
+        for withdraw in withdraws {
+            let reserved_amount = match &withdraw.reservation {
+                Reservation::MaxAmountU64(amount) => {
+                    assert!(*amount > 0, "verified in validity check");
+                    *amount
+                }
+                Reservation::EntireBalance => unreachable!("verified in validity check"),
+            };
+
+            let withdrawal_owner = withdraw.owner_for_withdrawal(self);
+
+            // unwrap checked at signing time
+            let account_id = AccumulatorValue::get_field_id(
+                withdrawal_owner,
+                &withdraw.type_arg.to_type_tag().unwrap(),
+            )
+            .unwrap();
+
+            let value = withdraw_map.entry(account_id).or_default();
+            // overflow checked at signing time
+            *value = value.checked_add(reserved_amount).unwrap();
+        }
+
+        withdraw_map
     }
 
     fn has_funds_withdrawals(&self) -> bool {
@@ -2566,51 +2595,94 @@ impl TransactionDataAPI for TransactionDataV1 {
     }
 
     fn get_funds_withdrawals(&self) -> Vec<FundsWithdrawalArg> {
-        let TransactionKind::ProgrammableTransaction(pt) = &self.kind else {
-            return vec![];
-        };
-        pt.inputs
-            .iter()
-            .filter_map(|input| {
-                if let CallArg::FundsWithdrawal(withdraw) = input {
-                    Some(withdraw.clone())
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.kind.get_funds_withdrawals().cloned().collect()
     }
 
     fn validity_check(&self, config: &ProtocolConfig) -> UserInputResult {
         if let TransactionExpiration::ValidDuring {
             min_epoch,
             max_epoch,
-            min_timestamp_seconds,
-            max_timestamp_seconds,
+            min_timestamp,
+            max_timestamp,
             ..
         } = self.expiration()
         {
-            if min_timestamp_seconds.is_some() || max_timestamp_seconds.is_some() {
+            if min_timestamp.is_some() || max_timestamp.is_some() {
                 return Err(UserInputError::Unsupported(
                     "Timestamp-based transaction expiration is not yet supported".to_string(),
                 ));
             }
 
-            /* Initially, we validate that (current_epoch == min_epoch == max_epoch) for simplicity.
-            This is intentionally overly strict, we intend to relax these rules as needed. */
             match (min_epoch, max_epoch) {
                 (Some(min), Some(max)) => {
-                    if min != max {
+                    if config.enable_multi_epoch_transaction_expiration() {
+                        if !(*max == *min || *max == min.saturating_add(1)) {
+                            return Err(UserInputError::Unsupported(
+                                "max_epoch must be at most min_epoch + 1".to_string(),
+                            ));
+                        }
+                    } else if min != max {
                         return Err(UserInputError::Unsupported(
-                            "Multi-epoch transaction expiration is not yet supported. min_epoch must equal max_epoch".to_string()
+                            "min_epoch must equal max_epoch".to_string(),
                         ));
                     }
                 }
                 _ => {
                     return Err(UserInputError::Unsupported(
-                        "Both min_epoch and max_epoch must be specified and equal".to_string(),
+                        "Both min_epoch and max_epoch must be specified".to_string(),
                     ));
                 }
+            }
+        }
+
+        if self.has_funds_withdrawals() {
+            fp_ensure!(
+                !self.gas().is_empty() || config.enable_address_balance_gas_payments(),
+                UserInputError::MissingGasPayment
+            );
+            fp_ensure!(
+                config.enable_accumulators(),
+                UserInputError::Unsupported("Address balance withdraw is not enabled".to_string())
+            );
+
+            // TODO(address-balances): Use a protocol config parameter for max_withdraws.
+            let max_withdraws = 10;
+
+            for (count, withdraw) in self.kind.get_funds_withdrawals().enumerate() {
+                fp_ensure!(
+                    count < max_withdraws,
+                    UserInputError::InvalidWithdrawReservation {
+                        error: format!(
+                            "Maximum number of balance withdraw reservations is {max_withdraws}"
+                        ),
+                    }
+                );
+
+                match withdraw.withdraw_from {
+                    WithdrawFrom::Sender => (),
+                    WithdrawFrom::Sponsor => {
+                        return Err(UserInputError::InvalidWithdrawReservation {
+                            error: "Explicit sponsor withdrawals are not yet supported".to_string(),
+                        });
+                    }
+                }
+
+                match withdraw.reservation {
+                    Reservation::MaxAmountU64(amount) => {
+                        fp_ensure!(
+                            amount > 0,
+                            UserInputError::InvalidWithdrawReservation {
+                                error: "Balance withdraw reservation amount must be non-zero"
+                                    .to_string(),
+                            }
+                        );
+                    }
+                    Reservation::EntireBalance => {
+                        return Err(UserInputError::InvalidWithdrawReservation {
+                            error: "Reserving the entire balance is not supported".to_string(),
+                        });
+                    }
+                };
             }
         }
 
@@ -2620,7 +2692,9 @@ impl TransactionDataAPI for TransactionDataV1 {
         {
             match self.expiration() {
                 TransactionExpiration::None => {
-                    return Err(UserInputError::MissingTransactionExpiration);
+                    // To avoid changing error behavior unnecessarily, we flag this as a missing gas payment error
+                    // instead of a missing expiration error.
+                    return Err(UserInputError::MissingGasPayment);
                 }
                 TransactionExpiration::Epoch(_) => {
                     return Err(UserInputError::InvalidExpiration {
@@ -2650,6 +2724,33 @@ impl TransactionDataAPI for TransactionDataV1 {
                 value: config.max_gas_payment_objects().to_string()
             }
         );
+
+        if !self.is_system_tx() {
+            let cost_table = SuiCostTable::new(config, self.gas_data.price);
+
+            fp_ensure!(
+                !check_for_gas_price_too_high(config.gas_model_version())
+                    || self.gas_data.price < config.max_gas_price(),
+                UserInputError::GasPriceTooHigh {
+                    max_gas_price: config.max_gas_price(),
+                }
+            );
+
+            fp_ensure!(
+                self.gas_data.budget <= cost_table.max_gas_budget,
+                UserInputError::GasBudgetTooHigh {
+                    gas_budget: self.gas_data().budget,
+                    max_budget: cost_table.max_gas_budget,
+                }
+            );
+            fp_ensure!(
+                self.gas_data.budget >= cost_table.min_transaction_cost,
+                UserInputError::GasBudgetTooLow {
+                    gas_budget: self.gas_data.budget,
+                    min_budget: cost_table.min_transaction_cost,
+                }
+            );
+        }
 
         self.validity_check_no_gas_check(config)
     }
@@ -2727,7 +2828,25 @@ impl TransactionDataAPI for TransactionDataV1 {
     }
 }
 
-impl TransactionDataV1 {}
+impl TransactionDataV1 {
+    fn get_funds_withdrawal_for_gas_payment(&self) -> Option<FundsWithdrawalArg> {
+        if self.is_gas_paid_from_address_balance() {
+            Some(if self.sender() != self.gas_owner() {
+                FundsWithdrawalArg::balance_from_sponsor(
+                    self.gas_data().budget,
+                    TypeInput::from(GAS::type_tag()),
+                )
+            } else {
+                FundsWithdrawalArg::balance_from_sender(
+                    self.gas_data().budget,
+                    TypeInput::from(GAS::type_tag()),
+                )
+            })
+        } else {
+            None
+        }
+    }
+}
 
 pub struct TxValidityCheckContext<'a> {
     pub config: &'a ProtocolConfig,
@@ -3011,27 +3130,6 @@ impl SenderSignedData {
                     return Err(SuiErrorKind::TransactionExpired.into());
                 }
             }
-        }
-
-        if tx_data.has_funds_withdrawals() {
-            fp_ensure!(
-                !tx_data.gas().is_empty() || context.config.enable_address_balance_gas_payments(),
-                SuiErrorKind::UserInputError {
-                    error: UserInputError::MissingGasPayment
-                }
-                .into()
-            );
-            fp_ensure!(
-                context.config.enable_accumulators()
-                    && context.accumulator_object_init_shared_version.is_some(),
-                SuiErrorKind::UserInputError {
-                    error: UserInputError::Unsupported(
-                        "Address balance withdraw is not enabled".to_string()
-                    )
-                }
-                .into()
-            );
-            tx_data.process_funds_withdrawals()?;
         }
 
         // Enforce overall transaction size limit.
@@ -3368,6 +3466,7 @@ impl Transaction {
             current_epoch,
             verify_params,
             Arc::new(VerifiedDigestCache::new_empty()),
+            vec![],
         )
     }
 
@@ -3392,6 +3491,7 @@ impl SignedTransaction {
             committee.epoch(),
             verify_params,
             Arc::new(VerifiedDigestCache::new_empty()),
+            vec![],
         )?;
 
         self.auth_sig().verify_secure(
@@ -3438,6 +3538,7 @@ impl CertifiedTransaction {
             committee.epoch(),
             verify_params,
             zklogin_inputs_cache,
+            vec![],
         )?;
         self.auth_sig().verify_secure(
             self.data(),
@@ -3470,6 +3571,140 @@ impl CertifiedTransaction {
 
 pub type VerifiedCertificate = VerifiedEnvelope<SenderSignedData, AuthorityStrongQuorumSignInfo>;
 pub type TrustedCertificate = TrustedEnvelope<SenderSignedData, AuthorityStrongQuorumSignInfo>;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WithAliases<T>(
+    T,
+    #[serde(with = "nonempty_as_vec")] NonEmpty<(SuiAddress, Option<SequenceNumber>)>,
+);
+
+impl<T> WithAliases<T> {
+    pub fn new(tx: T, aliases: NonEmpty<(SuiAddress, Option<SequenceNumber>)>) -> Self {
+        Self(tx, aliases)
+    }
+
+    pub fn tx(&self) -> &T {
+        &self.0
+    }
+
+    pub fn aliases(&self) -> &NonEmpty<(SuiAddress, Option<SequenceNumber>)> {
+        &self.1
+    }
+
+    pub fn into_tx(self) -> T {
+        self.0
+    }
+
+    pub fn into_aliases(self) -> NonEmpty<(SuiAddress, Option<SequenceNumber>)> {
+        self.1
+    }
+
+    pub fn into_inner(self) -> (T, NonEmpty<(SuiAddress, Option<SequenceNumber>)>) {
+        (self.0, self.1)
+    }
+}
+
+impl<T: Message, S> WithAliases<VerifiedEnvelope<T, S>> {
+    /// Analogous to VerifiedEnvelope::serializable.
+    pub fn serializable(self) -> WithAliases<TrustedEnvelope<T, S>> {
+        WithAliases(self.0.serializable(), self.1)
+    }
+}
+
+impl<S> WithAliases<Envelope<SenderSignedData, S>> {
+    pub fn no_aliases(tx: Envelope<SenderSignedData, S>) -> Self {
+        let no_aliases = tx
+            .intent_message()
+            .value
+            .required_signers()
+            .map(|s| (s, None));
+        Self::new(tx, no_aliases)
+    }
+}
+
+impl<S> WithAliases<VerifiedEnvelope<SenderSignedData, S>> {
+    pub fn no_aliases(tx: VerifiedEnvelope<SenderSignedData, S>) -> Self {
+        let no_aliases = tx
+            .intent_message()
+            .value
+            .required_signers()
+            .map(|s| (s, None));
+        Self::new(tx, no_aliases)
+    }
+}
+
+pub type TransactionWithAliases = WithAliases<Transaction>;
+pub type VerifiedTransactionWithAliases = WithAliases<VerifiedTransaction>;
+pub type TrustedTransactionWithAliases = WithAliases<TrustedTransaction>;
+
+impl<T: Message, S> From<WithAliases<VerifiedEnvelope<T, S>>> for WithAliases<Envelope<T, S>> {
+    fn from(value: WithAliases<VerifiedEnvelope<T, S>>) -> Self {
+        Self(value.0.into(), value.1)
+    }
+}
+
+impl<T: Message, S> From<WithAliases<TrustedEnvelope<T, S>>>
+    for WithAliases<VerifiedEnvelope<T, S>>
+{
+    fn from(value: WithAliases<TrustedEnvelope<T, S>>) -> Self {
+        Self(value.0.into(), value.1)
+    }
+}
+
+mod nonempty_as_vec {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S, T>(value: &NonEmpty<T>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: Serialize,
+    {
+        let vec: Vec<&T> = value.iter().collect();
+        vec.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<NonEmpty<T>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de> + Clone,
+    {
+        use serde::de::{SeqAccess, Visitor};
+        use std::fmt;
+        use std::marker::PhantomData;
+
+        struct NonEmptyVisitor<T>(PhantomData<T>);
+
+        impl<'de, T> Visitor<'de> for NonEmptyVisitor<T>
+        where
+            T: Deserialize<'de> + Clone,
+        {
+            type Value = NonEmpty<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a non-empty sequence")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let head = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::custom("empty vector"))?;
+
+                let mut tail = Vec::new();
+                while let Some(elem) = seq.next_element()? {
+                    tail.push(elem);
+                }
+
+                Ok(NonEmpty { head, tail })
+            }
+        }
+
+        deserializer.deserialize_seq(NonEmptyVisitor(PhantomData))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, PartialOrd, Ord, Hash)]
 pub enum InputObjectKind {
@@ -4172,13 +4407,14 @@ pub enum TransactionKey {
     Digest(TransactionDigest),
     RandomnessRound(EpochId, RandomnessRound),
     AccumulatorSettlement(EpochId, u64 /* checkpoint height */),
+    ConsensusCommitPrologue(EpochId, u64 /* round */, u32 /* sub_dag_index */),
 }
 
 impl TransactionKey {
     pub fn unwrap_digest(&self) -> &TransactionDigest {
         match self {
             TransactionKey::Digest(d) => d,
-            _ => panic!("called expect_digest on a non-Digest TransactionKey: {self:?}"),
+            _ => panic!("called unwrap_digest on a non-Digest TransactionKey: {self:?}"),
         }
     }
 

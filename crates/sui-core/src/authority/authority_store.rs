@@ -798,6 +798,11 @@ impl AuthorityStore {
             iter::once((transaction_digest, transaction.serializable_ref())),
         )?;
 
+        write_batch.insert_batch(
+            &self.perpetual_tables.executed_transaction_digests,
+            [((epoch_id, *transaction_digest), ())],
+        )?;
+
         // Add batched writes for objects and locks.
         write_batch.insert_batch(
             &self.perpetual_tables.object_per_epoch_marker_table_v2,
@@ -1590,6 +1595,18 @@ impl AuthorityStore {
         )
         .await;
         let _ = AuthorityStorePruner::compact(&self.perpetual_tables);
+    }
+
+    pub fn remove_executed_effects_for_testing(
+        &self,
+        tx_digest: &TransactionDigest,
+    ) -> anyhow::Result<()> {
+        let effects_digest = self.perpetual_tables.executed_effects.get(tx_digest)?;
+        if let Some(effects_digest) = effects_digest {
+            self.perpetual_tables.executed_effects.remove(tx_digest)?;
+            self.perpetual_tables.effects.remove(&effects_digest)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]

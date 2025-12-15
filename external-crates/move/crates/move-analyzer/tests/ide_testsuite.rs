@@ -13,7 +13,7 @@ use json_comments::StripComments;
 use lsp_types::{InlayHintKind, InlayHintLabel, InlayHintTooltip, Position};
 use move_analyzer::{
     code_action::access_chain_autofix_actions_for_error,
-    completions::{compute_completions_with_symbols, utils::compute_cursor},
+    completions::compute_completions_with_symbols,
     inlay_hints::inlay_hints_internal,
     symbols::{
         Symbols,
@@ -25,6 +25,7 @@ use move_analyzer::{
 };
 use move_command_line_common::testing::insta_assert;
 use move_compiler::{editions::Flavor, linters::LintLevel};
+use move_package_alt::flavor::{MoveFlavor, Vanilla};
 use serde::{Deserialize, Serialize};
 use url::Url;
 use vfs::{MemoryFS, VfsPath};
@@ -198,20 +199,22 @@ impl UseDefTest {
 }
 
 impl AutoCompletionTest {
-    fn test(
+    fn test<F: MoveFlavor>(
         &self,
         test_idx: usize,
-        compiled_pkg_info: &mut CompiledPkgInfo,
-        symbols: &mut Symbols,
+        packages_info: Arc<Mutex<CachedPackages>>,
+        ide_files_root: VfsPath,
+        project_path: &Path,
         output: &mut dyn std::io::Write,
         use_file_path: &Path,
     ) -> anyhow::Result<()> {
-        completion_test(
+        completion_test::<F>(
             self.use_line,
             self.use_col,
             test_idx,
-            compiled_pkg_info,
-            symbols,
+            packages_info,
+            ide_files_root,
+            project_path,
             output,
             use_file_path,
             false, // not for auto-import
@@ -220,20 +223,22 @@ impl AutoCompletionTest {
 }
 
 impl AutoImportTest {
-    fn test(
+    fn test<F: MoveFlavor>(
         &self,
         test_idx: usize,
-        compiled_pkg_info: &mut CompiledPkgInfo,
-        symbols: &mut Symbols,
+        packages_info: Arc<Mutex<CachedPackages>>,
+        ide_files_root: VfsPath,
+        project_path: &Path,
         output: &mut dyn std::io::Write,
         use_file_path: &Path,
     ) -> anyhow::Result<()> {
-        completion_test(
+        completion_test::<F>(
             self.use_line,
             self.use_col,
             test_idx,
-            compiled_pkg_info,
-            symbols,
+            packages_info,
+            ide_files_root,
+            project_path,
             output,
             use_file_path,
             true, // for auto-import
@@ -382,12 +387,13 @@ impl AccessChainQuickFixTest {
     }
 }
 
-fn completion_test(
+fn completion_test<F: MoveFlavor>(
     use_line: u32,
     use_col: u32,
     test_idx: usize,
-    compiled_pkg_info: &mut CompiledPkgInfo,
-    symbols: &mut Symbols,
+    packages_info: Arc<Mutex<CachedPackages>>,
+    ide_files_root: VfsPath,
+    project_path: &Path,
     output: &mut dyn std::io::Write,
     use_file_path: &Path,
     auto_import: bool,
@@ -399,12 +405,17 @@ fn completion_test(
         character: lsp_use_col,
     };
 
-    // symbols do not change for each test, so we can reuse the same symbols
-    // but we need to recompute the cursor each time
+    // Generate fresh symbols with cursor position using shared cache
     let cursor_path = use_file_path.to_path_buf();
-    compute_cursor(symbols, compiled_pkg_info, &cursor_path, use_pos);
+    let symbols = test_symbols_for_autocomplete::<F>(
+        packages_info,
+        ide_files_root,
+        project_path.to_path_buf(),
+        &cursor_path,
+        use_pos,
+    )?;
 
-    let items = compute_completions_with_symbols(symbols, &cursor_path, use_pos, auto_import);
+    let items = compute_completions_with_symbols(&symbols, &cursor_path, use_pos, auto_import);
     writeln!(output, "-- test {test_idx} -------------------")?;
     writeln!(output, "use line: {}, use_col: {}", use_line, use_col)?;
     for i in items {
@@ -436,45 +447,117 @@ fn completion_test(
 // Test Suite Runner Code
 //**************************************************************************************************
 
-fn initial_symbols(
+/// Compute symbols with optional file modifications to trigger incremental compilation.
+///
+/// When `file_modifications` is None, performs full compilation.
+/// When `file_modifications` is Some, writes modified content to VFS overlay,
+/// which triggers incremental compilation by causing file hash mismatches.
+///
+/// Returns both CompiledPkgInfo and Symbols for test suites that need both.
+fn test_symbols_with_optional_modifications<F: MoveFlavor>(
+    packages_info: Arc<Mutex<CachedPackages>>,
+    ide_files_root: VfsPath,
+    project_path: PathBuf,
+    file_modifications: Option<BTreeMap<PathBuf, String>>,
+) -> anyhow::Result<(CompiledPkgInfo, Symbols)> {
+    // Apply file modifications to VFS overlay if provided
+    if let Some(modifications) = file_modifications {
+        for (file_path, content) in modifications {
+            let vfs_path = ide_files_root
+                .join(file_path.to_string_lossy())
+                .map_err(|e| anyhow::anyhow!("Failed to create VFS path: {}", e))?;
+
+            // Create parent directories
+            let parent = vfs_path.parent();
+            parent
+                .create_dir_all()
+                .map_err(|e| anyhow::anyhow!("Failed to create directories: {}", e))?;
+
+            // Write modified content
+            let mut vfs_file = vfs_path
+                .create_file()
+                .map_err(|e| anyhow::anyhow!("Failed to create VFS file: {}", e))?;
+            vfs_file
+                .write_all(content.as_bytes())
+                .map_err(|e| anyhow::anyhow!("Failed to write file content: {}", e))?;
+        }
+    }
+
+    // Compile with modifications in overlay (or without if None)
+    let (compiled_pkg_info_opt, _) = get_compiled_pkg::<F>(
+        packages_info.clone(),
+        ide_files_root,
+        project_path.as_path(),
+        LintLevel::None,
+        Some(Flavor::Sui),
+        None, // No cursor file
+    )?;
+
+    let compiled_pkg_info =
+        compiled_pkg_info_opt.ok_or_else(|| anyhow::anyhow!("PACKAGE COMPILATION FAILED"))?;
+
+    // Compute symbols without cursor position
+    let symbols = compute_symbols(packages_info, compiled_pkg_info.clone(), None);
+
+    Ok((compiled_pkg_info, symbols))
+}
+
+/// Compute symbols for a specific cursor position in autocomplete tests.
+/// This generates fresh CompilerAutocompleteInfo for the cursor position
+/// while leveraging cached CompilerAnalysisInfo and dependencies.
+fn test_symbols_for_autocomplete<F: MoveFlavor>(
+    packages_info: Arc<Mutex<CachedPackages>>,
+    ide_files_root: VfsPath,
+    project_path: PathBuf,
+    cursor_path: &PathBuf,
+    cursor_pos: Position,
+) -> anyhow::Result<Symbols> {
+    // Single compilation with cursor position (no retry loop)
+    let (compiled_pkg_info_opt, _) = get_compiled_pkg::<F>(
+        packages_info.clone(),
+        ide_files_root,
+        project_path.as_path(),
+        LintLevel::None,
+        Some(Flavor::Sui),
+        Some(cursor_path),
+    )?;
+
+    let compiled_pkg_info =
+        compiled_pkg_info_opt.ok_or_else(|| anyhow::anyhow!("PACKAGE COMPILATION FAILED"))?;
+
+    // Compute symbols with cursor position
+    let symbols = compute_symbols(
+        packages_info,
+        compiled_pkg_info,
+        Some((cursor_path, cursor_pos)),
+    );
+
+    Ok(symbols)
+}
+
+fn use_def_test_suite<F: MoveFlavor>(
     project: String,
-) -> datatest_stable::Result<(PathBuf, CompiledPkgInfo, Symbols)> {
+    file_tests: BTreeMap<String, Vec<UseDefTest>>,
+) -> datatest_stable::Result<String> {
     let base_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut project_path = base_path.clone();
     project_path.push(project);
 
+    let packages_info = Arc::new(Mutex::new(CachedPackages::new()));
     let ide_files_root: VfsPath = MemoryFS::new().into();
-    let pkg_deps = Arc::new(Mutex::new(CachedPackages::new()));
 
-    // Similarly to `get_symbols`, we retry to exercise caching
-    let mut should_retry = true;
-    loop {
-        let (compiled_pkg_info_opt, _) = get_compiled_pkg(
-            pkg_deps.clone(),
-            ide_files_root.clone(),
-            project_path.as_path(),
-            LintLevel::None,
-            BTreeMap::new(),
-            Some(Flavor::Sui),
-        )?;
-        let compiled_pkg_info = compiled_pkg_info_opt.ok_or("PACKAGE COMPILATION FAILED")?;
-        let symbols = compute_symbols(pkg_deps.clone(), compiled_pkg_info.clone(), None);
-        if !should_retry {
-            return Ok((project_path, compiled_pkg_info, symbols));
-        }
-        should_retry = false;
-    }
-}
-
-fn use_def_test_suite(
-    project: String,
-    file_tests: BTreeMap<String, Vec<UseDefTest>>,
-) -> datatest_stable::Result<String> {
-    let (project_path, _, symbols) = initial_symbols(project)?;
+    // Initial full compilation to populate cache
+    test_symbols_with_optional_modifications::<F>(
+        packages_info.clone(),
+        ide_files_root.clone(),
+        project_path.clone(),
+        None,
+    )?;
 
     let mut output: BufWriter<_> = BufWriter::new(Vec::new());
     let writer: &mut dyn io::Write = output.get_mut();
 
+    let mut symbols_opt = None;
     for (file, tests) in file_tests {
         writeln!(
             writer,
@@ -485,13 +568,35 @@ fn use_def_test_suite(
 
         fpath.push(format!("sources/{file}"));
         let cpath = dunce::canonicalize(&fpath).unwrap();
+
+        if symbols_opt.is_none() {
+            // We do incremental compilation only for the first file in the test suite.
+            // The results for remaining files should still be correct due to all symbols
+            // being computed during the initial full compilation at suite level, and
+            // due to merging of symbols from modified and unmofdified files
+            // (which is what it is being tested here).
+
+            let original = std::fs::read_to_string(&cpath)?;
+            let modified = format!("{}// Test 0\n", original);
+            let mut modifications = BTreeMap::new();
+            modifications.insert(cpath.clone(), modified);
+
+            let (_, incremental_symbols) = test_symbols_with_optional_modifications::<F>(
+                packages_info.clone(),
+                ide_files_root.clone(),
+                project_path.clone(),
+                Some(modifications),
+            )?;
+            symbols_opt = Some(incremental_symbols);
+        }
+        let symbols = symbols_opt.as_ref().unwrap();
         let mod_symbols = symbols
             .file_use_defs
             .get(&cpath)
             .ok_or(format!("NO SYMBOLS FOR {}", cpath.to_str().unwrap()))?;
 
         for (idx, test) in tests.iter().enumerate() {
-            test.test(idx, mod_symbols, &symbols, writer, &file, &cpath)?;
+            test.test(idx, mod_symbols, symbols, writer, &file, &cpath)?;
             writeln!(writer)?;
         }
     }
@@ -500,11 +605,26 @@ fn use_def_test_suite(
     Ok(result)
 }
 
-fn auto_completion_test_suite(
+fn auto_completion_test_suite<F: MoveFlavor>(
     project: String,
     file_tests: BTreeMap<String, Vec<AutoCompletionTest>>,
 ) -> datatest_stable::Result<String> {
-    let (project_path, mut compiled_pkg_info, mut symbols) = initial_symbols(project)?;
+    // Create shared cache structure for all tests
+    let packages_info = Arc::new(Mutex::new(CachedPackages::new()));
+    let ide_files_root: VfsPath = MemoryFS::new().into();
+
+    // Get project path
+    let base_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut project_path = base_path.clone();
+    project_path.push(project);
+
+    // Initial full compilation to populate cache
+    test_symbols_with_optional_modifications::<F>(
+        packages_info.clone(),
+        ide_files_root.clone(),
+        project_path.clone(),
+        None,
+    )?;
 
     let mut output: BufWriter<_> = BufWriter::new(Vec::new());
     let writer: &mut dyn io::Write = output.get_mut();
@@ -521,7 +641,15 @@ fn auto_completion_test_suite(
         let cpath = dunce::canonicalize(&fpath).unwrap();
 
         for (idx, test) in tests.iter().enumerate() {
-            test.test(idx, &mut compiled_pkg_info, &mut symbols, writer, &cpath)?;
+            // Each test gets fresh symbols via explicit cache and cursor position
+            test.test::<F>(
+                idx,
+                packages_info.clone(),
+                ide_files_root.clone(),
+                &project_path,
+                writer,
+                &cpath,
+            )?;
         }
     }
 
@@ -529,11 +657,26 @@ fn auto_completion_test_suite(
     Ok(result)
 }
 
-fn auto_import_test_suite(
+fn auto_import_test_suite<F: MoveFlavor>(
     project: String,
     file_tests: BTreeMap<String, Vec<AutoImportTest>>,
 ) -> datatest_stable::Result<String> {
-    let (project_path, mut compiled_pkg_info, mut symbols) = initial_symbols(project)?;
+    // Create shared cache structure for all tests
+    let packages_info = Arc::new(Mutex::new(CachedPackages::new()));
+    let ide_files_root: VfsPath = MemoryFS::new().into();
+
+    // Get project path
+    let base_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut project_path = base_path.clone();
+    project_path.push(project);
+
+    // Initial full compilation to populate cache
+    test_symbols_with_optional_modifications::<F>(
+        packages_info.clone(),
+        ide_files_root.clone(),
+        project_path.clone(),
+        None,
+    )?;
 
     let mut output: BufWriter<_> = BufWriter::new(Vec::new());
     let writer: &mut dyn io::Write = output.get_mut();
@@ -550,7 +693,15 @@ fn auto_import_test_suite(
         let cpath = dunce::canonicalize(&fpath).unwrap();
 
         for (idx, test) in tests.iter().enumerate() {
-            test.test(idx, &mut compiled_pkg_info, &mut symbols, writer, &cpath)?;
+            // Each test gets fresh symbols via explicit cache and cursor position
+            test.test::<F>(
+                idx,
+                packages_info.clone(),
+                ide_files_root.clone(),
+                &project_path,
+                writer,
+                &cpath,
+            )?;
         }
     }
 
@@ -558,11 +709,23 @@ fn auto_import_test_suite(
     Ok(result)
 }
 
-fn cursor_test_suite(
+fn cursor_test_suite<F: MoveFlavor>(
     project: String,
     file_tests: BTreeMap<String, Vec<CursorTest>>,
 ) -> datatest_stable::Result<String> {
-    let (project_path, compiled_pkg_info, mut symbols) = initial_symbols(project)?;
+    let base_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut project_path = base_path.clone();
+    project_path.push(project);
+
+    let packages_info = Arc::new(Mutex::new(CachedPackages::new()));
+    let ide_files_root: VfsPath = MemoryFS::new().into();
+
+    let (compiled_pkg_info, mut symbols) = test_symbols_with_optional_modifications::<F>(
+        packages_info.clone(),
+        ide_files_root,
+        project_path.clone(),
+        None,
+    )?;
 
     let mut output: BufWriter<_> = BufWriter::new(Vec::new());
     let writer: &mut dyn io::Write = output.get_mut();
@@ -586,11 +749,24 @@ fn cursor_test_suite(
     Ok(result)
 }
 
-fn hint_test_suite(
+fn hint_test_suite<F: MoveFlavor>(
     project: String,
     file_tests: BTreeMap<String, Vec<HintTest>>,
 ) -> datatest_stable::Result<String> {
-    let (project_path, _, symbols) = initial_symbols(project)?;
+    let base_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut project_path = base_path.clone();
+    project_path.push(project);
+
+    let packages_info = Arc::new(Mutex::new(CachedPackages::new()));
+    let ide_files_root: VfsPath = MemoryFS::new().into();
+
+    // Full compilation once at suite level - reused for all tests
+    let (_, symbols) = test_symbols_with_optional_modifications::<F>(
+        packages_info.clone(),
+        ide_files_root.clone(),
+        project_path.clone(),
+        None,
+    )?;
 
     let mut output: BufWriter<_> = BufWriter::new(Vec::new());
     let writer: &mut dyn io::Write = output.get_mut();
@@ -615,11 +791,24 @@ fn hint_test_suite(
     Ok(result)
 }
 
-fn access_chain_quick_fix_test_suite(
+fn access_chain_quick_fix_test_suite<F: MoveFlavor>(
     project: String,
     file_tests: BTreeMap<String, Vec<AccessChainQuickFixTest>>,
 ) -> datatest_stable::Result<String> {
-    let (project_path, mut compiled_pkg_info, mut symbols) = initial_symbols(project)?;
+    let base_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut project_path = base_path.clone();
+    project_path.push(project);
+
+    let packages_info = Arc::new(Mutex::new(CachedPackages::new()));
+    let ide_files_root: VfsPath = MemoryFS::new().into();
+
+    // Compile once at suite level
+    let (mut compiled_pkg_info, mut symbols) = test_symbols_with_optional_modifications::<F>(
+        packages_info.clone(),
+        ide_files_root.clone(),
+        project_path.clone(),
+        None,
+    )?;
 
     let mut output: BufWriter<_> = BufWriter::new(Vec::new());
     let writer: &mut dyn io::Write = output.get_mut();
@@ -644,7 +833,7 @@ fn access_chain_quick_fix_test_suite(
     Ok(result)
 }
 
-fn move_ide_testsuite(test_path: &Path) -> datatest_stable::Result<()> {
+fn move_ide_testsuite<F: MoveFlavor>(test_path: &Path) -> datatest_stable::Result<()> {
     let suite_file = io::BufReader::new(File::open(test_path)?);
     let stripped = StripComments::new(suite_file);
     let suite: TestSuite = serde_json::from_reader(stripped)?;
@@ -653,27 +842,27 @@ fn move_ide_testsuite(test_path: &Path) -> datatest_stable::Result<()> {
         TestSuite::UseDef {
             project,
             file_tests,
-        } => use_def_test_suite(project, file_tests),
+        } => use_def_test_suite::<F>(project, file_tests),
         TestSuite::AutoCompletion {
             project,
             file_tests,
-        } => auto_completion_test_suite(project, file_tests),
+        } => auto_completion_test_suite::<F>(project, file_tests),
         TestSuite::AutoImport {
             project,
             file_tests,
-        } => auto_import_test_suite(project, file_tests),
+        } => auto_import_test_suite::<F>(project, file_tests),
         TestSuite::Cursor {
             project,
             file_tests,
-        } => cursor_test_suite(project, file_tests),
+        } => cursor_test_suite::<F>(project, file_tests),
         TestSuite::Hint {
             project,
             file_tests,
-        } => hint_test_suite(project, file_tests),
+        } => hint_test_suite::<F>(project, file_tests),
         TestSuite::AccessChainQuickFixTest {
             project,
             file_tests,
-        } => access_chain_quick_fix_test_suite(project, file_tests),
+        } => access_chain_quick_fix_test_suite::<F>(project, file_tests),
     }?;
 
     insta_assert! {
@@ -683,7 +872,7 @@ fn move_ide_testsuite(test_path: &Path) -> datatest_stable::Result<()> {
     Ok(())
 }
 
-datatest_stable::harness!(move_ide_testsuite, "tests/", r".*\.ide$");
+datatest_stable::harness!(move_ide_testsuite::<Vanilla>, "tests/", r".*\.ide$");
 
 /// Generates cursor tests as json -- useful for making a new batch of tests. Update this list,
 /// set `harness = true` for this file in `Cargo.toml`,

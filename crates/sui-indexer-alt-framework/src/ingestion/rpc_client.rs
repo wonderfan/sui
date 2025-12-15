@@ -1,7 +1,6 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::ingestion::client::{FetchData, FetchError, FetchResult, IngestionClientTrait};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use prost_types::FieldMask;
@@ -11,11 +10,15 @@ use sui_rpc::proto::sui::rpc::v2::GetCheckpointRequest;
 use sui_types::full_checkpoint_content::Checkpoint;
 use tonic::Code;
 
+use crate::ingestion::ingestion_client::{
+    FetchData, FetchError, FetchResult, IngestionClientTrait,
+};
+
 #[async_trait]
 impl IngestionClientTrait for RpcClient {
     async fn fetch(&self, checkpoint: u64) -> FetchResult {
-        let request = GetCheckpointRequest::by_sequence_number(checkpoint).with_read_mask(
-            FieldMask::from_paths([
+        let request: GetCheckpointRequest = GetCheckpointRequest::by_sequence_number(checkpoint)
+            .with_read_mask(FieldMask::from_paths([
                 "summary.bcs",
                 "signature",
                 "contents.bcs",
@@ -24,8 +27,7 @@ impl IngestionClientTrait for RpcClient {
                 "transactions.effects.unchanged_loaded_runtime_objects",
                 "transactions.events.bcs",
                 "objects.objects.bcs",
-            ]),
-        );
+            ]));
 
         let response = self
             .clone()

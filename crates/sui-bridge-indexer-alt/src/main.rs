@@ -10,11 +10,11 @@ use sui_bridge_indexer_alt::handlers::token_transfer_data_handler::TokenTransfer
 use sui_bridge_indexer_alt::handlers::token_transfer_handler::TokenTransferHandler;
 use sui_bridge_indexer_alt::metrics::BridgeIndexerMetrics;
 use sui_bridge_schema::MIGRATIONS;
-use sui_indexer_alt_framework::ingestion::ClientArgs;
+use sui_indexer_alt_framework::ingestion::{ClientArgs, ingestion_client::IngestionClientArgs};
 use sui_indexer_alt_framework::postgres::DbArgs;
+use sui_indexer_alt_framework::service::Error;
 use sui_indexer_alt_framework::{Indexer, IndexerArgs};
 use sui_indexer_alt_metrics::{MetricsArgs, MetricsService};
-use tokio_util::sync::CancellationToken;
 use url::Url;
 
 #[derive(Parser)]
@@ -49,18 +49,14 @@ async fn main() -> Result<(), anyhow::Error> {
         remote_store_url,
     } = Args::parse();
 
-    let cancel = CancellationToken::new();
+    let is_bounded_job = indexer_args.last_checkpoint.is_some();
     let registry = Registry::new_custom(Some("bridge".into()), None)
         .context("Failed to create Prometheus registry.")?;
 
     // Initialize bridge-specific metrics
     let bridge_metrics = BridgeIndexerMetrics::new(&registry);
 
-    let metrics = MetricsService::new(
-        MetricsArgs { metrics_address },
-        registry,
-        cancel.child_token(),
-    );
+    let metrics = MetricsService::new(MetricsArgs { metrics_address }, registry);
 
     let metrics_prefix = None;
     let mut indexer = Indexer::new_from_pg(
@@ -68,14 +64,16 @@ async fn main() -> Result<(), anyhow::Error> {
         db_args,
         indexer_args,
         ClientArgs {
-            remote_store_url: Some(remote_store_url),
+            ingestion: IngestionClientArgs {
+                remote_store_url: Some(remote_store_url),
+                ..Default::default()
+            },
             ..Default::default()
         },
         Default::default(),
         Some(&MIGRATIONS),
         metrics_prefix,
         metrics.registry(),
-        cancel.clone(),
     )
     .await?;
 
@@ -101,11 +99,23 @@ async fn main() -> Result<(), anyhow::Error> {
         .concurrent_pipeline(ErrorTransactionHandler, Default::default())
         .await?;
 
-    let h_indexer = indexer.run().await?;
-    let h_metrics = metrics.run().await?;
+    let s_indexer = indexer.run().await?;
+    let s_metrics = metrics.run().await?;
 
-    let _ = h_indexer.await;
-    cancel.cancel();
-    let _ = h_metrics.await;
-    Ok(())
+    match s_indexer.attach(s_metrics).main().await {
+        Ok(()) => Ok(()),
+        Err(Error::Terminated) => {
+            if is_bounded_job {
+                std::process::exit(1);
+            } else {
+                Ok(())
+            }
+        }
+        Err(Error::Aborted) => {
+            std::process::exit(1);
+        }
+        Err(Error::Task(_)) => {
+            std::process::exit(2);
+        }
+    }
 }

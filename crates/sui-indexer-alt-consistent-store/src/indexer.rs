@@ -9,9 +9,8 @@ use sui_indexer_alt_framework::{
     self as framework, IndexerArgs,
     ingestion::{ClientArgs, IngestionConfig},
     pipeline::sequential::{self, SequentialConfig},
+    service::Service,
 };
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::ConsistencyConfig,
@@ -59,7 +58,6 @@ impl<S: Schema + Send + Sync + 'static> Indexer<S> {
         ingestion_config: IngestionConfig,
         db_config: DbConfig,
         registry: &Registry,
-        cancel: CancellationToken,
     ) -> anyhow::Result<Self> {
         let store = Store::open(
             path,
@@ -74,7 +72,6 @@ impl<S: Schema + Send + Sync + 'static> Indexer<S> {
             consistency_config.stride,
             consistency_config.buffer_size,
             indexer_args.first_checkpoint,
-            cancel.child_token(),
         );
 
         let metrics_prefix = Some("consistent_indexer");
@@ -85,7 +82,6 @@ impl<S: Schema + Send + Sync + 'static> Indexer<S> {
             ingestion_config,
             metrics_prefix,
             registry,
-            cancel.child_token(),
         )
         .await
         .context("Failed to create indexer")?;
@@ -120,6 +116,7 @@ impl<S: Schema + Send + Sync + 'static> Indexer<S> {
             H::NAME
         );
 
+        // TODO: Refactor consistent store indexer to use `init_watermark` instead of wrapping `sequential_pipeline`.
         self.sync
             .register_pipeline(H::NAME)
             .with_context(|| format!("Failed to add pipeline {:?} to synchronizer", H::NAME))?;
@@ -135,16 +132,15 @@ impl<S: Schema + Send + Sync + 'static> Indexer<S> {
     /// Start ingesting checkpoints, consuming the indexer in the process.
     ///
     /// See [`framework::Indexer::run`] for details.
-    pub(crate) async fn run(self) -> anyhow::Result<JoinHandle<()>> {
+    pub(crate) async fn run(self) -> anyhow::Result<Service> {
         // Associate the indexer's store with the synchronizer. This spins up a separate task for
         // each pipeline that was registered, and installs the write queues that talk to those
         // tasks into the store, so that when a write arrives to the store for a particular
         // pipeline, it can make its way to the right task.
-        let h_sync = self.indexer.store().sync(self.sync)?;
-        let h_indexer = self.indexer.run();
-        Ok(tokio::spawn(async move {
-            let (_, _) = futures::join!(h_sync, h_indexer);
-        }))
+        let s_sync = self.indexer.store().sync(self.sync)?;
+        let s_indexer = self.indexer.run().await?;
+
+        Ok(s_indexer.attach(s_sync))
     }
 }
 
@@ -153,6 +149,7 @@ mod tests {
     use std::sync::Arc;
 
     use sui_indexer_alt_framework::{
+        ingestion::ingestion_client::IngestionClientArgs,
         pipeline::Processor,
         types::{full_checkpoint_content::Checkpoint, object::Object},
     };
@@ -230,14 +227,16 @@ mod tests {
                 d.path().join("db"),
                 IndexerArgs::default(),
                 ClientArgs {
-                    local_ingestion_path: Some(d.path().join("checkpoints")),
+                    ingestion: IngestionClientArgs {
+                        local_ingestion_path: Some(d.path().join("checkpoints")),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
                 ConsistencyConfig::default(),
                 IngestionConfig::default(),
                 DbConfig::default(),
                 &prometheus::Registry::new(),
-                CancellationToken::new(),
             )
             .await
             .unwrap();
@@ -260,14 +259,16 @@ mod tests {
                 d.path().join("db"),
                 IndexerArgs::default(),
                 ClientArgs {
-                    local_ingestion_path: Some(d.path().join("checkpoints")),
+                    ingestion: IngestionClientArgs {
+                        local_ingestion_path: Some(d.path().join("checkpoints")),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
                 ConsistencyConfig::default(),
                 IngestionConfig::default(),
                 DbConfig::default(),
                 &prometheus::Registry::new(),
-                CancellationToken::new(),
             )
             .await
             .unwrap();

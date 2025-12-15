@@ -28,13 +28,15 @@ use extensions::{
 use headers::ContentLength;
 use health::DbProbe;
 use prometheus::Registry;
+use sui_futures::service::Service;
 use sui_indexer_alt_reader::pg_reader::db::DbArgs;
 use sui_indexer_alt_reader::system_package_task::{SystemPackageTask, SystemPackageTaskArgs};
 use sui_indexer_alt_reader::{
-    bigtable_reader::{BigtableArgs, BigtableReader},
+    bigtable_reader::BigtableReader,
     consistent_reader::{ConsistentReader, ConsistentReaderArgs},
     fullnode_client::{FullnodeArgs, FullnodeClient},
     kv_loader::KvLoader,
+    ledger_grpc_reader::LedgerGrpcReader,
     package_resolver::{DbPackageStore, PackageCache},
     pg_reader::PgReader,
 };
@@ -42,10 +44,9 @@ use task::{
     chain_identifier,
     watermark::{WatermarkTask, WatermarksLock},
 };
-use tokio::{net::TcpListener, task::JoinHandle};
-use tokio_util::sync::CancellationToken;
+use tokio::{net::TcpListener, sync::oneshot};
 use tower_http::cors;
-use tracing::{error, info};
+use tracing::info;
 use url::Url;
 
 use crate::api::{mutation::Mutation, query::Query};
@@ -98,9 +99,6 @@ pub struct RpcService<Q, M, S> {
 
     /// Metrics for the RPC service.
     metrics: Arc<RpcMetrics>,
-
-    /// Cancellation token controls lifecycle of all RPC-related services.
-    cancel: CancellationToken,
 }
 
 impl<Q, M, S> RpcService<Q, M, S>
@@ -114,7 +112,6 @@ where
         version: &'static str,
         schema: SchemaBuilder<Q, M, S>,
         registry: &Registry,
-        cancel: CancellationToken,
     ) -> Self {
         let RpcArgs {
             rpc_listen_address,
@@ -134,7 +131,6 @@ where
             router,
             schema,
             metrics,
-            cancel,
         }
     }
 
@@ -172,7 +168,7 @@ where
 
     /// Run the RPC service. This binds the listener and exposes handlers for the RPC service and IDE
     /// (if enabled).
-    pub async fn run(self) -> anyhow::Result<JoinHandle<()>>
+    pub async fn run(self) -> anyhow::Result<Service>
     where
         Q: ObjectType + 'static,
         M: ObjectType + 'static,
@@ -185,7 +181,6 @@ where
             mut router,
             schema,
             metrics: _,
-            cancel,
         } = self;
 
         if with_ide {
@@ -213,24 +208,23 @@ where
             .await
             .context("Failed to bind GraphQL to listen address")?;
 
-        let service = axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown({
-            let cancel = cancel.clone();
-            async move {
-                cancel.cancelled().await;
-                info!("Shutdown received, shutting down GraphQL service");
-            }
-        });
-
-        Ok(tokio::spawn(async move {
-            if let Err(e) = service.await.context("Failed to start GraphQL service") {
-                error!("Failed to start GraphQL service: {e:?}");
-                cancel.cancel();
-            }
-        }))
+        let (stx, srx) = oneshot::channel::<()>();
+        Ok(Service::new()
+            .with_shutdown_signal(async move {
+                let _ = stx.send(());
+            })
+            .spawn(async move {
+                axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
+                    let _ = srx.await;
+                    info!("Shutdown received, shutting down GraphQL service");
+                })
+                .await
+                .context("Failed to start GraphQL service")
+            }))
     }
 }
 
@@ -253,14 +247,12 @@ pub fn schema() -> SchemaBuilder<Query, Mutation, EmptySubscription> {
 }
 
 /// Set-up and run the RPC service, using the provided arguments (expected to be extracted from the
-/// command-line). The service will continue to run until the cancellation token is triggered, and
-/// will signal cancellation on the token when it is shutting down.
+/// command-line).
 ///
 /// Access to most reads is controlled by the `database_url` -- if it is `None`, those reads will
-/// not work. KV queries can optionally be served by a Bigtable instance, if `bigtable_instance` is
-/// provided, otherwise these requests are served by the database. If a `bigtable_instance` is
-/// provided, the `GOOGLE_APPLICATION_CREDENTIALS` environment variable must point to the
-/// credentials JSON file.
+/// not work. KV queries can optionally be served by a Bigtable instance or Ledger gRPC service
+/// via `kv_args`. If a Bigtable instance is configured, the `GOOGLE_APPLICATION_CREDENTIALS`
+/// environment variable must point to the credentials JSON file.
 ///
 /// `version` is the version string reported in response headers by the service as part of every
 /// request.
@@ -269,10 +261,9 @@ pub fn schema() -> SchemaBuilder<Query, Mutation, EmptySubscription> {
 /// and will clean these up on shutdown as well.
 pub async fn start_rpc(
     database_url: Option<Url>,
-    bigtable_instance: Option<String>,
     fullnode_args: FullnodeArgs,
     db_args: DbArgs,
-    bigtable_args: BigtableArgs,
+    kv_args: args::KvArgs,
     consistent_reader_args: ConsistentReaderArgs,
     args: RpcArgs,
     system_package_task_args: SystemPackageTaskArgs,
@@ -280,34 +271,22 @@ pub async fn start_rpc(
     config: RpcConfig,
     pg_pipelines: Vec<String>,
     registry: &Registry,
-    cancel: CancellationToken,
-) -> anyhow::Result<JoinHandle<()>> {
-    let rpc = RpcService::new(args, version, schema(), registry, cancel.child_token());
+) -> anyhow::Result<Service> {
+    let rpc = RpcService::new(args, version, schema(), registry);
     let metrics = rpc.metrics();
 
     // Create gRPC full node client wrapper
-    let fullnode_client = FullnodeClient::new(
-        Some("graphql_fullnode"),
-        fullnode_args,
-        registry,
-        cancel.child_token(),
-    )
-    .await?;
+    let fullnode_client =
+        FullnodeClient::new(Some("graphql_fullnode"), fullnode_args, registry).await?;
 
-    let pg_reader = PgReader::new(
-        Some("graphql_db"),
-        database_url.clone(),
-        db_args,
-        registry,
-        cancel.child_token(),
-    )
-    .await?;
+    let pg_reader =
+        PgReader::new(Some("graphql_db"), database_url.clone(), db_args, registry).await?;
 
-    let bigtable_reader = if let Some(instance_id) = bigtable_instance {
+    let bigtable_reader = if let Some(instance_id) = kv_args.bigtable_instance.as_ref() {
         let reader = BigtableReader::new(
-            instance_id,
+            instance_id.clone(),
             "indexer-alt-graphql".to_owned(),
-            bigtable_args,
+            kv_args.bigtable_args(),
             registry,
         )
         .await?;
@@ -317,17 +296,23 @@ pub async fn start_rpc(
         None
     };
 
-    let consistent_reader = ConsistentReader::new(
-        Some("graphql_consistent"),
-        consistent_reader_args,
-        registry,
-        cancel.child_token(),
-    )
-    .await?;
+    let ledger_grpc_reader = if let Some(ledger_grpc_url) = kv_args.ledger_grpc_url.as_ref() {
+        let reader = LedgerGrpcReader::new(ledger_grpc_url.clone(), kv_args.ledger_grpc_args())
+            .await
+            .context("Failed to create Ledger gRPC reader")?;
+        Some(reader)
+    } else {
+        None
+    };
+
+    let consistent_reader =
+        ConsistentReader::new(Some("graphql_consistent"), consistent_reader_args, registry).await?;
 
     let pg_loader = Arc::new(pg_reader.as_data_loader());
     let kv_loader = if let Some(reader) = bigtable_reader.as_ref() {
         KvLoader::new_with_bigtable(Arc::new(reader.as_data_loader()))
+    } else if let Some(reader) = ledger_grpc_reader.as_ref() {
+        KvLoader::new_with_ledger_grpc(Arc::new(reader.as_data_loader()))
     } else {
         KvLoader::new_with_pg(pg_loader.clone())
     };
@@ -338,25 +323,22 @@ pub async fn start_rpc(
         system_package_task_args,
         pg_reader.clone(),
         package_store.clone(),
-        cancel.child_token(),
     );
 
     // Fetch and cache the chain identifier from the database.
-    let chain_identifier = chain_identifier::task(
-        &pg_reader,
+    let (chain_identifier, s_chain_id) = chain_identifier::task(
+        pg_reader.clone(),
         config.watermark.watermark_polling_interval,
-        cancel.child_token(),
-    )
-    .await?;
+    );
 
     let watermark_task = WatermarkTask::new(
         config.watermark,
         pg_pipelines,
         pg_reader.clone(),
         bigtable_reader,
+        ledger_grpc_reader,
         consistent_reader.clone(),
         metrics.clone(),
-        cancel.child_token(),
     );
 
     let rpc = rpc
@@ -382,16 +364,14 @@ pub async fn start_rpc(
         .data(package_store)
         .data(fullnode_client);
 
-    let h_rpc = rpc.run().await?;
-    let h_system_package_task = system_package_task.run();
-    let h_watermark = watermark_task.run();
+    let s_rpc = rpc.run().await?;
+    let s_system_package_task = system_package_task.run();
+    let s_watermark = watermark_task.run();
 
-    Ok(tokio::spawn(async move {
-        let _ = h_rpc.await;
-        cancel.cancel();
-        let _ = h_system_package_task.await;
-        let _ = h_watermark.await;
-    }))
+    Ok(s_rpc
+        .attach(s_chain_id)
+        .attach(s_system_package_task)
+        .attach(s_watermark))
 }
 
 /// Handler for RPC requests (POST requests making GraphQL queries).

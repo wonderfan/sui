@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 /// The minimum and maximum protocol versions supported by this build.
 const MIN_PROTOCOL_VERSION: u64 = 1;
-const MAX_PROTOCOL_VERSION: u64 = 102;
+const MAX_PROTOCOL_VERSION: u64 = 105;
 
 // Record history of protocol version allocations here:
 //
@@ -275,6 +275,12 @@ const MAX_PROTOCOL_VERSION: u64 = 102;
 // Version 100: Framework update
 // Version 101: Framework update
 //              Set max updates per settlement txn to 100.
+// Version 103: Framework update: internal Coin methods
+// Version 104: Framework update: CoinRegistry follow up for Coin methods
+//              Enable all non-zero PCRs parsing for nitro attestation native function in Devnet and Testnet.
+// Version 105: Framework update: address aliases
+//              Enable address balances on devnet
+//              Enable multi-epoch transaction expiration.
 
 #[derive(Copy, Clone, Debug, Hash, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProtocolVersion(u64);
@@ -552,6 +558,10 @@ struct FeatureFlags {
     #[serde(skip_serializing_if = "is_false")]
     enable_nitro_attestation_upgraded_parsing: bool,
 
+    // Enable upgraded parsing of nitro attestation containing all nonzero PCRs.
+    #[serde(skip_serializing_if = "is_false")]
+    enable_nitro_attestation_all_nonzero_pcrs_parsing: bool,
+
     // Reject functions with mutable Random.
     #[serde(skip_serializing_if = "is_false")]
     reject_mutable_random_on_entry_functions: bool,
@@ -772,6 +782,10 @@ struct FeatureFlags {
     #[serde(skip_serializing_if = "is_false")]
     enable_address_balance_gas_payments: bool,
 
+    // Enable multi-epoch transaction expiration (max 1 epoch difference)
+    #[serde(skip_serializing_if = "is_false")]
+    enable_multi_epoch_transaction_expiration: bool,
+
     // Enable statically type checked ptb execution
     #[serde(skip_serializing_if = "is_false")]
     enable_ptb_execution_v2: bool,
@@ -883,6 +897,22 @@ struct FeatureFlags {
     // If true, deprecate global storage ops everywhere.
     #[serde(skip_serializing_if = "is_false")]
     deprecate_global_storage_ops: bool,
+
+    // If true, skip GC'ed accept votes in CommitFinalizer.
+    #[serde(skip_serializing_if = "is_false")]
+    consensus_skip_gced_accept_votes: bool,
+
+    // If true, include cancelled randomness txns in the consensus commit prologue.
+    #[serde(skip_serializing_if = "is_false")]
+    include_cancelled_randomness_txns_in_prologue: bool,
+
+    // Enables address aliases.
+    #[serde(skip_serializing_if = "is_false")]
+    address_aliases: bool,
+
+    // If true, enable object funds withdraw.
+    #[serde(skip_serializing_if = "is_false")]
+    enable_object_funds_withdraw: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -956,10 +986,10 @@ pub struct ExecutionTimeEstimateParams {
 #[derive(Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum PerObjectCongestionControlMode {
     #[default]
-    None, // No congestion control.
-    TotalGasBudget,        // Use txn gas budget as execution cost.
-    TotalTxCount,          // Use total txn count as execution cost.
-    TotalGasBudgetWithCap, // Use txn gas budget as execution cost with a cap.
+    None, // Deprecated.
+    TotalGasBudget,                                     // Deprecated.
+    TotalTxCount,                                       // Deprecated.
+    TotalGasBudgetWithCap,                              // Deprecated.
     ExecutionTimeEstimate(ExecutionTimeEstimateParams), // Use execution time estimate as execution cost.
 }
 
@@ -1652,14 +1682,10 @@ pub struct ProtocolConfig {
     /// Transactions will be cancelled after this many rounds.
     max_deferral_rounds_for_congestion_control: Option<u64>,
 
-    /// If >0, congestion control will allow the configured maximum accumulated cost per object
-    /// to be exceeded by at most the given amount. Only one limit-exceeding transaction per
-    /// object will be allowed, unless bursting is configured below.
+    /// DEPRECATED. Do not use.
     max_txn_cost_overage_per_object_in_commit: Option<u64>,
 
-    /// If >0, congestion control will allow transactions in total cost equaling the
-    /// configured amount to exceed the configured maximum accumulated cost per object.
-    /// As above, up to one transaction per object exceeding the burst limit will be allowed.
+    /// DEPRECATED. Do not use.
     allowed_txn_cost_overage_burst_per_object_in_commit: Option<u64>,
 
     /// Minimum interval of commit timestamps between consecutive checkpoints.
@@ -1691,13 +1717,10 @@ pub struct ProtocolConfig {
     /// is disabled.
     consensus_gc_depth: Option<u32>,
 
-    /// Used to calculate the max transaction cost when using TotalGasBudgetWithCap as shard
-    /// object congestion control strategy. Basically the max transaction cost is calculated as
-    /// (num of input object + num of commands) * this factor.
+    /// DEPRECATED. Do not use.
     gas_budget_based_txn_cost_cap_factor: Option<u64>,
 
-    /// Adds an absolute cap on the maximum transaction cost when using TotalGasBudgetWithCap at
-    /// the given multiple of the per-commit budget.
+    /// DEPRECATED. Do not use.
     gas_budget_based_txn_cost_absolute_cap_commit_count: Option<u64>,
 
     /// SIP-45: K in the formula `amplification_factor = max(0, gas_price / reference_gas_price - K)`.
@@ -1736,10 +1759,6 @@ pub struct ProtocolConfig {
     /// The multiplier for the number of type references when charging for type checking and reference
     /// checking.
     translation_per_reference_node_charge: Option<u64>,
-
-    /// The metering step resolution for translation costs. This is the granularity at which we
-    /// step up the metering for translation costs.
-    translation_metering_step_resolution: Option<u64>,
 
     /// The multiplier for each linkage entry when charging for linkage tables that we have
     /// created.
@@ -2030,6 +2049,10 @@ impl ProtocolConfig {
         self.feature_flags.enable_address_balance_gas_payments
     }
 
+    pub fn enable_multi_epoch_transaction_expiration(&self) -> bool {
+        self.feature_flags.enable_multi_epoch_transaction_expiration
+    }
+
     pub fn enable_authenticated_event_streams(&self) -> bool {
         self.feature_flags.enable_authenticated_event_streams && self.enable_accumulators()
     }
@@ -2159,9 +2182,6 @@ impl ProtocolConfig {
     }
 
     pub fn mysticeti_fastpath(&self) -> bool {
-        if let Some(enabled) = is_mysticeti_fpc_enabled_in_env() {
-            return enabled;
-        }
         self.feature_flags.mysticeti_fastpath
     }
 
@@ -2233,6 +2253,11 @@ impl ProtocolConfig {
         self.feature_flags.enable_nitro_attestation_upgraded_parsing
     }
 
+    pub fn enable_nitro_attestation_all_nonzero_pcrs_parsing(&self) -> bool {
+        self.feature_flags
+            .enable_nitro_attestation_all_nonzero_pcrs_parsing
+    }
+
     pub fn get_consensus_commit_rate_estimation_window_size(&self) -> u32 {
         self.consensus_commit_rate_estimation_window_size
             .unwrap_or(0)
@@ -2285,21 +2310,7 @@ impl ProtocolConfig {
     }
 
     pub fn enable_ptb_execution_v2(&self) -> bool {
-        let enabled = self.feature_flags.enable_ptb_execution_v2;
-        // PTB execution v2 requires gas model version > 10 and the translation charges to be set.
-        if enabled {
-            debug_assert!(self.translation_per_command_base_charge.is_some());
-            debug_assert!(self.translation_per_input_base_charge.is_some());
-            debug_assert!(self.translation_pure_input_per_byte_charge.is_some());
-            debug_assert!(self.translation_per_type_node_charge.is_some());
-            debug_assert!(self.translation_per_reference_node_charge.is_some());
-            debug_assert!(self.translation_metering_step_resolution.is_some());
-            debug_assert!(self.translation_per_linkage_entry_charge.is_some());
-            debug_assert!(self.feature_flags.abstract_size_in_object_runtime);
-            debug_assert!(self.feature_flags.object_runtime_charge_cache_load_gas);
-            debug_assert!(self.gas_model_version.is_some_and(|version| version > 10));
-        }
-        enabled
+        self.feature_flags.enable_ptb_execution_v2
     }
 
     pub fn better_adapter_type_resolution_errors(&self) -> bool {
@@ -2408,6 +2419,31 @@ impl ProtocolConfig {
 
     pub fn deprecate_global_storage_ops(&self) -> bool {
         self.feature_flags.deprecate_global_storage_ops
+    }
+
+    pub fn consensus_skip_gced_accept_votes(&self) -> bool {
+        self.feature_flags.consensus_skip_gced_accept_votes
+    }
+
+    pub fn include_cancelled_randomness_txns_in_prologue(&self) -> bool {
+        self.feature_flags
+            .include_cancelled_randomness_txns_in_prologue
+    }
+
+    pub fn address_aliases(&self) -> bool {
+        let address_aliases = self.feature_flags.address_aliases;
+        assert!(
+            !address_aliases || self.mysticeti_fastpath(),
+            "Address aliases requires Mysticeti fastpath to be enabled"
+        );
+        if address_aliases {
+            // TODO: when flag for disabling CertifiedTransaction is added, add assertion for it here.
+        }
+        address_aliases
+    }
+
+    pub fn enable_object_funds_withdraw(&self) -> bool {
+        self.feature_flags.enable_object_funds_withdraw
     }
 }
 
@@ -2979,7 +3015,6 @@ impl ProtocolConfig {
             translation_pure_input_per_byte_charge: None,
             translation_per_type_node_charge: None,
             translation_per_reference_node_charge: None,
-            translation_metering_step_resolution: None,
             translation_per_linkage_entry_charge: None,
 
             max_updates_per_settlement_txn: None,
@@ -4206,7 +4241,7 @@ impl ProtocolConfig {
                 95 => {
                     cfg.type_name_id_base_cost = Some(52);
 
-                    // Reudce the frequency of checkpoint splitting under high TPS.
+                    // Reduce the frequency of checkpoint splitting under high TPS.
                     cfg.max_transactions_per_checkpoint = Some(20_000);
                 }
                 96 => {
@@ -4264,6 +4299,49 @@ impl ProtocolConfig {
                             },
                         );
                     cfg.feature_flags.deprecate_global_storage_ops = true;
+                }
+                103 => {}
+                104 => {
+                    cfg.translation_per_command_base_charge = Some(1);
+                    cfg.translation_per_input_base_charge = Some(1);
+                    cfg.translation_pure_input_per_byte_charge = Some(1);
+                    cfg.translation_per_type_node_charge = Some(1);
+                    cfg.translation_per_reference_node_charge = Some(1);
+                    cfg.translation_per_linkage_entry_charge = Some(10);
+                    cfg.gas_model_version = Some(11);
+                    cfg.feature_flags.abstract_size_in_object_runtime = true;
+                    cfg.feature_flags.object_runtime_charge_cache_load_gas = true;
+                    cfg.dynamic_field_hash_type_and_key_cost_base = Some(52);
+                    cfg.dynamic_field_add_child_object_cost_base = Some(52);
+                    cfg.dynamic_field_add_child_object_value_cost_per_byte = Some(1);
+                    cfg.dynamic_field_borrow_child_object_cost_base = Some(52);
+                    cfg.dynamic_field_borrow_child_object_child_ref_cost_per_byte = Some(1);
+                    cfg.dynamic_field_remove_child_object_cost_base = Some(52);
+                    cfg.dynamic_field_remove_child_object_child_cost_per_byte = Some(1);
+                    cfg.dynamic_field_has_child_object_cost_base = Some(52);
+                    cfg.dynamic_field_has_child_object_with_ty_cost_base = Some(52);
+                    cfg.feature_flags.enable_ptb_execution_v2 = true;
+
+                    cfg.poseidon_bn254_cost_base = Some(260);
+
+                    cfg.feature_flags.consensus_skip_gced_accept_votes = true;
+
+                    if chain != Chain::Mainnet {
+                        cfg.feature_flags
+                            .enable_nitro_attestation_all_nonzero_pcrs_parsing = true;
+                    }
+
+                    cfg.feature_flags
+                        .include_cancelled_randomness_txns_in_prologue = true;
+                }
+                105 => {
+                    if chain != Chain::Mainnet && chain != Chain::Testnet {
+                        cfg.feature_flags.enable_accumulators = true;
+                        cfg.feature_flags.enable_address_balance_gas_payments = true;
+                        cfg.feature_flags.enable_authenticated_event_streams = true;
+                        cfg.feature_flags.enable_object_funds_withdraw = true;
+                    }
+                    cfg.feature_flags.enable_multi_epoch_transaction_expiration = true;
                 }
                 // Use this template when making changes:
                 //
@@ -4529,6 +4607,10 @@ impl ProtocolConfig {
         self.feature_flags.correct_gas_payment_limit_check = val;
     }
 
+    pub fn set_address_aliases_for_testing(&mut self, val: bool) {
+        self.feature_flags.address_aliases = val;
+    }
+
     pub fn set_consensus_round_prober_probe_accepted_rounds(&mut self, val: bool) {
         self.feature_flags
             .consensus_round_prober_probe_accepted_rounds = val;
@@ -4544,29 +4626,6 @@ impl ProtocolConfig {
 
     pub fn set_consensus_batched_block_sync_for_testing(&mut self, val: bool) {
         self.feature_flags.consensus_batched_block_sync = val;
-    }
-
-    /// NB: We are setting a number of feature flags and protocol config fields here to to
-    /// facilitate testing of PTB execution v2. These feature flags and config fields should be set
-    /// with or before enabling PTB execution v2 in a real protocol upgrade.
-    pub fn set_enable_ptb_execution_v2_for_testing(&mut self, val: bool) {
-        self.feature_flags.enable_ptb_execution_v2 = val;
-        // Remove this and set these fields when we move this to be set for a specific protocol
-        // version.
-        if val {
-            self.translation_per_command_base_charge = Some(1);
-            self.translation_per_input_base_charge = Some(1);
-            self.translation_pure_input_per_byte_charge = Some(1);
-            self.translation_per_type_node_charge = Some(1);
-            self.translation_per_reference_node_charge = Some(1);
-            self.translation_metering_step_resolution = Some(1000);
-            self.translation_per_linkage_entry_charge = Some(10);
-            if self.gas_model_version.is_some_and(|version| version <= 10) {
-                self.gas_model_version = Some(11);
-            }
-            self.feature_flags.abstract_size_in_object_runtime = true;
-            self.feature_flags.object_runtime_charge_cache_load_gas = true;
-        }
     }
 
     pub fn set_record_time_estimate_processed_for_testing(&mut self, val: bool) {
@@ -4585,8 +4644,17 @@ impl ProtocolConfig {
         self.feature_flags.enable_accumulators = true;
     }
 
+    pub fn disable_accumulators_for_testing(&mut self) {
+        self.feature_flags.enable_accumulators = false;
+        self.feature_flags.enable_address_balance_gas_payments = false;
+    }
+
     pub fn create_root_accumulator_object_for_testing(&mut self) {
         self.feature_flags.create_root_accumulator_object = true;
+    }
+
+    pub fn disable_create_root_accumulator_object_for_testing(&mut self) {
+        self.feature_flags.create_root_accumulator_object = false;
     }
 
     pub fn enable_address_balance_gas_payments_for_testing(&mut self) {
@@ -4595,11 +4663,23 @@ impl ProtocolConfig {
         self.feature_flags.enable_address_balance_gas_payments = true;
     }
 
+    pub fn disable_address_balance_gas_payments_for_testing(&mut self) {
+        self.feature_flags.enable_address_balance_gas_payments = false;
+    }
+
+    pub fn enable_multi_epoch_transaction_expiration_for_testing(&mut self) {
+        self.feature_flags.enable_multi_epoch_transaction_expiration = true;
+    }
+
     pub fn enable_authenticated_event_streams_for_testing(&mut self) {
         self.enable_accumulators_for_testing();
         self.feature_flags.enable_authenticated_event_streams = true;
         self.feature_flags
             .include_checkpoint_artifacts_digest_in_summary = true;
+    }
+
+    pub fn disable_authenticated_event_streams_for_testing(&mut self) {
+        self.feature_flags.enable_authenticated_event_streams = false;
     }
 
     pub fn enable_non_exclusive_writes_for_testing(&mut self) {
@@ -4636,6 +4716,14 @@ impl ProtocolConfig {
 
     pub fn allow_references_in_ptbs_for_testing(&mut self) {
         self.feature_flags.allow_references_in_ptbs = true;
+    }
+
+    pub fn set_consensus_skip_gced_accept_votes_for_testing(&mut self, val: bool) {
+        self.feature_flags.consensus_skip_gced_accept_votes = val;
+    }
+
+    pub fn set_enable_object_funds_withdraw_for_testing(&mut self, val: bool) {
+        self.feature_flags.enable_object_funds_withdraw = val;
     }
 }
 
@@ -4726,18 +4814,6 @@ macro_rules! check_limit_by_meter {
         result
     }};
 }
-
-pub fn is_mysticeti_fpc_enabled_in_env() -> Option<bool> {
-    if let Ok(v) = std::env::var("CONSENSUS") {
-        if v == "mysticeti_fpc" {
-            return Some(true);
-        } else if v == "mysticeti" {
-            return Some(false);
-        }
-    }
-    None
-}
-
 #[cfg(all(test, not(msim)))]
 mod test {
     use insta::assert_yaml_snapshot;

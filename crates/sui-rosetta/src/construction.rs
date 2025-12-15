@@ -128,6 +128,8 @@ pub async fn combine(
         place_holder_epoch,
         &VerifyParams::default(),
         Arc::new(VerifiedDigestCache::new_empty()), // no need to use cache in rosetta
+        // TODO: This will fail for tx sent from aliased addresses.
+        vec![],
     )?;
     let signed_tx_bytes = bcs::to_bytes(&signed_tx)?;
 
@@ -151,7 +153,6 @@ pub async fn submit(
     let signatures = signed_tx
         .tx_signatures()
         .iter()
-        .cloned()
         .map(UserSignature::from)
         .collect();
 
@@ -277,6 +278,12 @@ pub async fn metadata(
     // make sure it works over epoch changes
     gas_price += 100;
 
+    // Check operation type before moving it
+    let is_pay_sui_or_stake = matches!(
+        &option.internal_operation,
+        InternalOperation::PaySui(_) | InternalOperation::Stake(_)
+    );
+
     let TransactionObjectData {
         gas_coins,
         objects,
@@ -287,10 +294,22 @@ pub async fn metadata(
         .internal_operation
         .try_fetch_needed_objects(&mut context.client.clone(), Some(gas_price), budget)
         .await?;
+
+    // For backwards compatibility during rolling deployments, populate extra_gas_coins.
+    // Old clients expect this field to be present.
+    // For PaySui/Stake: extra_gas_coins contains the coins to merge (same as objects)
+    // For PayCoin/WithdrawStake: extra_gas_coins is empty
+    let extra_gas_coins = if is_pay_sui_or_stake {
+        objects.clone()
+    } else {
+        vec![]
+    };
+
     Ok(ConstructionMetadataResponse {
         metadata: ConstructionMetadata {
             sender,
             gas_coins,
+            extra_gas_coins,
             objects,
             party_objects,
             total_coin_value: total_sui_balance,

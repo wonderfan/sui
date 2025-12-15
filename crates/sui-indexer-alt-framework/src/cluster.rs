@@ -9,16 +9,15 @@ use std::{
 use anyhow::Context;
 use diesel_migrations::EmbeddedMigrations;
 use prometheus::Registry;
+use sui_futures::service::Service;
 use sui_indexer_alt_metrics::{MetricsArgs, MetricsService};
-use tokio::{signal, task::JoinHandle};
-use tokio_util::sync::CancellationToken;
-use tracing::info;
 use url::Url;
 
-use crate::postgres::{Db, DbArgs};
 use crate::{
-    Indexer, IndexerArgs, IndexerMetrics, Result,
+    Indexer, IndexerArgs, Result,
     ingestion::{ClientArgs, IngestionConfig},
+    metrics::{IndexerMetrics, IngestionMetrics},
+    postgres::{Db, DbArgs},
 };
 
 /// Bundle of arguments for setting up an indexer cluster (an Indexer and its associated Metrics
@@ -45,9 +44,6 @@ pub struct Args {
 pub struct IndexerCluster {
     indexer: Indexer<Db>,
     metrics: MetricsService,
-
-    /// Cancelling this token signals cancellation to both the indexer and metrics service.
-    cancel: CancellationToken,
 }
 
 /// Builder for creating an IndexerCluster with a fluent API
@@ -151,9 +147,8 @@ impl IndexerClusterBuilder {
 
         tracing_subscriber::fmt::init();
 
-        let cancel = CancellationToken::new();
         let registry = Registry::new();
-        let metrics = MetricsService::new(self.args.metrics_args, registry, cancel.child_token());
+        let metrics = MetricsService::new(self.args.metrics_args, registry);
         let client_args = self.args.client_args.context("client_args is required")?;
 
         let indexer = Indexer::new_from_pg(
@@ -165,15 +160,10 @@ impl IndexerClusterBuilder {
             self.migrations,
             self.metrics_prefix.as_deref(),
             metrics.registry(),
-            cancel.child_token(),
         )
         .await?;
 
-        Ok(IndexerCluster {
-            indexer,
-            metrics,
-            cancel,
-        })
+        Ok(IndexerCluster { indexer, metrics })
     }
 }
 
@@ -185,42 +175,24 @@ impl IndexerCluster {
 
     /// Access to the indexer's metrics. This can be cloned before a call to [Self::run], to retain
     /// shared access to the underlying metrics.
-    pub fn metrics(&self) -> &Arc<IndexerMetrics> {
-        self.indexer.metrics()
+    pub fn indexer_metrics(&self) -> &Arc<IndexerMetrics> {
+        self.indexer.indexer_metrics()
     }
 
-    /// This token controls stopping the indexer and metrics service. Clone it before calling
-    /// [Self::run] to retain the ability to stop the service after it has started.
-    pub fn cancel(&self) -> &CancellationToken {
-        &self.cancel
+    /// Access to the ingestion service's metrics. This can be cloned before a call to [Self::run],
+    /// to retain shared access to the underlying metrics.
+    pub fn ingestion_metrics(&self) -> &Arc<IngestionMetrics> {
+        self.indexer.ingestion_metrics()
     }
 
-    /// Starts the indexer and metrics service, returning a handle to `await` the service's exit.
+    /// Starts the indexer and metrics service, returning a handle over the service's tasks.
     /// The service will exit when the indexer has finished processing all the checkpoints it was
-    /// configured to process, or when it receives an interrupt signal.
-    pub async fn run(self) -> Result<JoinHandle<()>> {
-        let h_ctrl_c = tokio::spawn({
-            let cancel = self.cancel.clone();
-            async move {
-                tokio::select! {
-                    _ = cancel.cancelled() => {}
-                    _ = signal::ctrl_c() => {
-                        info!("Received Ctrl-C, shutting down...");
-                        cancel.cancel();
-                    }
-                }
-            }
-        });
+    /// configured to process, or when it is instructed to shut down.
+    pub async fn run(self) -> Result<Service> {
+        let s_indexer = self.indexer.run().await?;
+        let s_metrics = self.metrics.run().await?;
 
-        let h_metrics = self.metrics.run().await?;
-        let h_indexer = self.indexer.run().await?;
-
-        Ok(tokio::spawn(async move {
-            let _ = h_indexer.await;
-            self.cancel.cancel();
-            let _ = h_metrics.await;
-            let _ = h_ctrl_c.await;
-        }))
+        Ok(s_indexer.attach(s_metrics))
     }
 }
 
@@ -250,6 +222,7 @@ mod tests {
 
     use crate::FieldCount;
     use crate::ingestion::ClientArgs;
+    use crate::ingestion::ingestion_client::IngestionClientArgs;
     use crate::pipeline::Processor;
     use crate::pipeline::concurrent::ConcurrentConfig;
     use crate::postgres::{
@@ -345,7 +318,10 @@ mod tests {
 
         let args = Args {
             client_args: Some(ClientArgs {
-                local_ingestion_path: Some(checkpoint_dir.path().to_owned()),
+                ingestion: IngestionClientArgs {
+                    local_ingestion_path: Some(checkpoint_dir.path().to_owned()),
+                    ..Default::default()
+                },
                 ..Default::default()
             }),
             indexer_args: IndexerArgs {
@@ -368,11 +344,12 @@ mod tests {
             .await
             .unwrap();
 
-        let metrics = indexer.metrics().clone();
+        let ingestion_metrics = indexer.ingestion_metrics().clone();
+        let indexer_metrics = indexer.indexer_metrics().clone();
 
         // Run the indexer until it signals completion. We have configured it to stop after
         // ingesting 10 checkpoints, so it should shut itself down.
-        indexer.run().await.unwrap().await.unwrap();
+        indexer.run().await.unwrap().join().await.unwrap();
 
         // Check that the results were all written out.
         {
@@ -386,19 +363,20 @@ mod tests {
             assert_eq!(counts.len(), 10);
             for (i, count) in counts.iter().enumerate() {
                 assert_eq!(count.cp_sequence_number, i as i64);
-                assert_eq!(count.count, 2);
+                assert_eq!(count.count, 3); // 2 user transactions + 1 settlement transaction
             }
         }
 
-        // Check that metrics were updated.
-        assert_eq!(metrics.total_ingested_checkpoints.get(), 10);
-        assert_eq!(metrics.total_ingested_transactions.get(), 20);
-        assert_eq!(metrics.latest_ingested_checkpoint.get(), 9);
+        // Check that ingestion metrics were updated.
+        assert_eq!(ingestion_metrics.total_ingested_checkpoints.get(), 10);
+        // 10 checkpoints, 2 user transactions + 1 settlement transaction per checkpoint
+        assert_eq!(ingestion_metrics.total_ingested_transactions.get(), 30);
+        assert_eq!(ingestion_metrics.latest_ingested_checkpoint.get(), 9);
 
         macro_rules! assert_pipeline_metric {
             ($name:ident, $value:expr) => {
                 assert_eq!(
-                    metrics
+                    indexer_metrics
                         .$name
                         .get_metric_with_label_values(&["tx_counts"])
                         .unwrap()
@@ -419,8 +397,9 @@ mod tests {
         // The watermark checkpoint is inclusive, but the transaction is exclusive
         assert_pipeline_metric!(watermark_checkpoint, 9);
         assert_pipeline_metric!(watermark_checkpoint_in_db, 9);
-        assert_pipeline_metric!(watermark_transaction, 20);
-        assert_pipeline_metric!(watermark_transaction_in_db, 20);
+        // 10 checkpoints, 2 user transactions + 1 settlement transaction per checkpoint
+        assert_pipeline_metric!(watermark_transaction, 30);
+        assert_pipeline_metric!(watermark_transaction_in_db, 30);
     }
 
     #[test]
@@ -432,7 +411,10 @@ mod tests {
                     ..Default::default()
                 },
                 client_args: Some(ClientArgs {
-                    local_ingestion_path: Some("/bundled".into()),
+                    ingestion: IngestionClientArgs {
+                        local_ingestion_path: Some("/bundled".into()),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 }),
                 metrics_args: MetricsArgs {
@@ -444,7 +426,10 @@ mod tests {
                 ..Default::default()
             })
             .with_client_args(ClientArgs {
-                local_ingestion_path: Some("/individual".into()),
+                ingestion: IngestionClientArgs {
+                    local_ingestion_path: Some("/individual".into()),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .with_metrics_args(MetricsArgs {
@@ -457,6 +442,7 @@ mod tests {
                 .args
                 .client_args
                 .unwrap()
+                .ingestion
                 .local_ingestion_path
                 .unwrap()
                 .to_string_lossy(),
@@ -476,7 +462,10 @@ mod tests {
                 ..Default::default()
             })
             .with_client_args(ClientArgs {
-                local_ingestion_path: Some("/individual".into()),
+                ingestion: IngestionClientArgs {
+                    local_ingestion_path: Some("/individual".into()),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .with_metrics_args(MetricsArgs {
@@ -488,7 +477,10 @@ mod tests {
                     ..Default::default()
                 },
                 client_args: Some(ClientArgs {
-                    local_ingestion_path: Some("/bundled".into()),
+                    ingestion: IngestionClientArgs {
+                        local_ingestion_path: Some("/bundled".into()),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 }),
                 metrics_args: MetricsArgs {
@@ -502,6 +494,7 @@ mod tests {
                 .args
                 .client_args
                 .unwrap()
+                .ingestion
                 .local_ingestion_path
                 .unwrap()
                 .to_string_lossy(),

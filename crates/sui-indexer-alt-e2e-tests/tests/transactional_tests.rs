@@ -16,7 +16,7 @@ use reqwest::{Client, header::HeaderName};
 use serde_json::{Value, json};
 use sui_indexer_alt::config::{ConcurrentLayer, IndexerConfig, Merge, PipelineLayer, PrunerLayer};
 use sui_indexer_alt_e2e_tests::{OffchainCluster, OffchainClusterConfig};
-use sui_indexer_alt_framework::ingestion::ClientArgs;
+use sui_indexer_alt_framework::ingestion::{ClientArgs, ingestion_client::IngestionClientArgs};
 use sui_transactional_test_runner::{
     create_adapter,
     offchain_state::{OffchainStateReader, TestResponse},
@@ -24,7 +24,6 @@ use sui_transactional_test_runner::{
     test_adapter::{OffChainConfig, PRE_COMPILED, SuiTestAdapter},
 };
 use tokio::join;
-use tokio_util::sync::CancellationToken;
 
 struct OffchainReader {
     cluster: Arc<OffchainCluster>,
@@ -133,7 +132,10 @@ impl OffchainStateReader for OffchainReader {
 
 async fn cluster(config: &OffChainConfig) -> Arc<OffchainCluster> {
     let client_args = ClientArgs {
-        local_ingestion_path: Some(config.data_ingestion_path.clone()),
+        ingestion: IngestionClientArgs {
+            local_ingestion_path: Some(config.data_ingestion_path.clone()),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -169,7 +171,6 @@ async fn cluster(config: &OffChainConfig) -> Arc<OffchainCluster> {
                 ..Default::default()
             },
             &prometheus::Registry::new(),
-            CancellationToken::new(),
         )
         .await
         .expect("Failed to create off-chain cluster"),
@@ -195,12 +196,5 @@ async fn run_test(path: &Path) -> Result<(), Box<dyn Error>> {
 
     // run the tasks in the test
     run_tasks_with_adapter(path, adapter, output, None).await?;
-
-    // clean-up the off-chain cluster
-    Arc::try_unwrap(c)
-        .unwrap_or_else(|_| panic!("Failed to unwrap off-chain cluster"))
-        .stopped()
-        .await;
-
     Ok(())
 }

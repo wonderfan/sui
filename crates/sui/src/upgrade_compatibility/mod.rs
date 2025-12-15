@@ -43,7 +43,7 @@ use move_core_types::{
     identifier::{IdentStr, Identifier},
 };
 use move_ir_types::location::{ByteIndex, Loc};
-use move_package::compilation::compiled_package::CompiledUnitWithSource;
+use move_package_alt_compilation::compiled_package::CompiledUnitWithSource;
 use sui_json_rpc_types::{SuiObjectDataOptions, SuiRawData};
 use sui_move_build::CompiledPackage;
 use sui_protocol_config::ProtocolConfig;
@@ -805,12 +805,18 @@ fn compare_packages(
     if diags.is_empty() {
         Ok(())
     } else {
+        // Sort diagnostics to ensure consistent error ordering across platforms
+        // Diagnostic implements Ord, so sorting will be deterministic
+        let mut sorted_vec = diags.into_vec();
+        sorted_vec.sort();
+        let sorted_diags: Diagnostics = sorted_vec.into_iter().collect();
+
         Err(anyhow!(
             "{}\nUpgrade failed, this package requires changes to be compatible with the existing package. \
-            Its upgrade policy is set to '{}'.",
+            Its upgrade policy is set to '{}'. Use --skip-verify-compatibility to bypass this check locally.",
             String::from_utf8(report_diagnostics_to_buffer(
                 &new_package.package.file_map,
-                diags,
+                sorted_diags,
                 use_colors()
             ))
             .context("Unable to convert buffer to string")?,

@@ -4,7 +4,7 @@
 # tests that sui move new followed by sui move disassemble succeeds
 
 
-sui move new example
+sui move --client.config $CONFIG new example
 cat > example/sources/example.move <<EOF
 module example::example;
 
@@ -12,8 +12,8 @@ public fun foo(_ctx: &mut TxContext) {}
 EOF
 cd example
 
-echo "=== Build ===" | tee /dev/stderr
-sui move build
+echo "=== Build ===" >&2
+sui move --client.config $CONFIG build
 
-echo "=== Disassemble ===" | tee /dev/stderr
-sui move disassemble build/example/bytecode_modules/example.mv
+echo "=== Disassemble ===" >&2
+sui move --client.config $CONFIG disassemble build/example/bytecode_modules/example.mv

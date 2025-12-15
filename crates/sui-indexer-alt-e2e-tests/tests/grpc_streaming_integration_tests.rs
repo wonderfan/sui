@@ -5,10 +5,14 @@ use std::time::Duration;
 
 use diesel::QueryDsl;
 use diesel_async::RunQueryDsl;
+use prometheus::Registry;
 use sui_field_count::FieldCount;
 use sui_indexer_alt_framework::{
-    cluster::IndexerCluster,
-    ingestion::ClientArgs,
+    Indexer, IndexerArgs,
+    ingestion::{
+        ClientArgs, IngestionConfig, ingestion_client::IngestionClientArgs,
+        streaming_client::StreamingClientArgs,
+    },
     pipeline::{
         Processor,
         concurrent::{self, BatchStatus, ConcurrentConfig},
@@ -132,18 +136,24 @@ async fn test_indexer_cluster_with_grpc_streaming() {
 
     // Set up the indexer with gRPC streaming endpoint from TestCluster
     let client_args = ClientArgs {
-        local_ingestion_path: Some(checkpoint_dir.path().to_owned()),
+        ingestion: IngestionClientArgs {
+            local_ingestion_path: Some(checkpoint_dir.path().to_owned()),
+            ..Default::default()
+        },
         // Use the TestCluster's RPC URL as the gRPC streaming endpoint
-        streaming_url: Some(test_cluster.rpc_url().parse().unwrap()),
-        ..Default::default()
+        streaming: StreamingClientArgs {
+            streaming_url: Some(test_cluster.rpc_url().parse().unwrap()),
+        },
     };
 
     // Create writer/reader for database operations
     let reader = Db::for_read(url.clone(), DbArgs::default()).await.unwrap();
     let writer = Db::for_write(url.clone(), DbArgs::default()).await.unwrap();
 
-    // Create the tx_counts table
+    // Create the schema for the test.
     {
+        writer.run_migrations(None).await.unwrap();
+
         let mut conn = writer.connect().await.unwrap();
         diesel::sql_query(
             r#"
@@ -158,13 +168,17 @@ async fn test_indexer_cluster_with_grpc_streaming() {
         .unwrap();
     }
 
-    // Build the indexer cluster with gRPC streaming configuration
-    let mut indexer = IndexerCluster::builder()
-        .with_database_url(url.clone())
-        .with_client_args(client_args)
-        .build()
-        .await
-        .unwrap();
+    // Build the indexer with gRPC streaming configuration
+    let mut indexer = Indexer::new(
+        writer,
+        IndexerArgs::default(),
+        client_args,
+        IngestionConfig::default(),
+        None,
+        &Registry::new(),
+    )
+    .await
+    .unwrap();
 
     // Add the tx_counts pipeline
     indexer
@@ -172,11 +186,10 @@ async fn test_indexer_cluster_with_grpc_streaming() {
         .await
         .unwrap();
 
-    let cancel = indexer.cancel().clone();
-
     // Run the indexer - it will use gRPC streaming from TestCluster
-    // and fall back to local ingestion if needed
-    let handle = indexer.run().await.unwrap();
+    // and fall back to local ingestion if needed. Hold on to the service so it doesn't get
+    // dropped (and therefore aborted) until the test ends.
+    let _service = indexer.run().await.unwrap();
 
     // Poll every 100ms with a 5s timeout for the sum of user transactions to reach 5
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -197,7 +210,4 @@ async fn test_indexer_cluster_with_grpc_streaming() {
     })
     .await
     .expect("Timeout: Expected sum of user transactions to reach 5 within 5 seconds");
-
-    cancel.cancel();
-    handle.await.unwrap();
 }

@@ -5,7 +5,7 @@
 //! to a represenatation that can be used for computing symbols.
 
 use crate::{
-    compiler_info::CompilerInfo,
+    compiler_info::{CompilerAnalysisInfo, CompilerAutocompleteInfo, process_ide_annotations},
     diagnostics::{lsp_diagnostics, lsp_empty_diagnostics},
     symbols::{
         def_info::DefInfo,
@@ -43,10 +43,14 @@ use move_compiler::{
     typing::ast::ModuleDefinition,
 };
 use move_ir_types::location::Loc;
-use move_package::{
-    compilation::{build_plan::BuildPlan, compiled_package::ModuleFormat},
-    resolution::resolution_graph::ResolvedGraph,
-    source_package::parsed_manifest::{Dependencies, PackageName},
+
+use move_package_alt::{flavor::MoveFlavor, package::RootPackage};
+use move_package_alt_compilation::{
+    build_config::BuildConfig,
+    build_plan::BuildPlan,
+    compilation::{compiler_flags, make_deps_for_compiler},
+    find_env,
+    source_discovery::get_sources,
 };
 
 pub const MANIFEST_FILE_NAME: &str = "Move.toml";
@@ -97,8 +101,10 @@ pub struct CompiledPkgInfo {
     pub mapped_files: MappedFiles,
     /// Edition of the compiler
     pub edition: Option<Edition>,
-    /// Compiler info
-    pub compiler_info: Option<CompilerInfo>,
+    /// Compiler analysis info
+    pub compiler_analysis_info: Option<CompilerAnalysisInfo>,
+    /// Compiler autocomplete info
+    pub compiler_autocomplete_info: Option<CompilerAutocompleteInfo>,
     /// IDE diagnostics related to the package
     pub lsp_diags: Arc<BTreeMap<PathBuf, Vec<Diagnostic>>>,
 }
@@ -125,8 +131,8 @@ pub struct CachedPkgInfo {
     pub user_file_hashes: Arc<BTreeMap<PathBuf, FileHash>>,
     /// Edition of the compiler used to build this package
     pub edition: Option<Edition>,
-    /// Compiler info
-    pub compiler_info: Option<CompilerInfo>,
+    /// Compiler analysis info (cached)
+    pub compiler_analysis_info: Option<CompilerAnalysisInfo>,
     /// IDE diagnostics related to the package
     pub lsp_diags: Arc<BTreeMap<PathBuf, Vec<Diagnostic>>>,
 }
@@ -181,7 +187,7 @@ struct MappedFilesData {
 struct CachingResult {
     pkg_deps: Option<AnalyzedPkgInfo>,
     edition: Option<Edition>,
-    compiler_info: Option<CompilerInfo>,
+    compiler_analysis_info: Option<CompilerAnalysisInfo>,
 }
 
 impl CachedPackages {
@@ -219,6 +225,7 @@ impl AnalyzedPkgInfo {
     pub fn new_precompiled_only(
         program_deps: Arc<PreCompiledProgramInfo>,
         dep_names: BTreeSet<Symbol>,
+        dep_hashes: Vec<FileHash>,
     ) -> Self {
         Self {
             program_deps,
@@ -227,7 +234,7 @@ impl AnalyzedPkgInfo {
             program: None,
             file_paths: Arc::new(BTreeMap::new()),
             user_file_hashes: Arc::new(BTreeMap::new()),
-            dep_hashes: vec![],
+            dep_hashes,
         }
     }
 }
@@ -270,12 +277,12 @@ impl CachingResult {
     pub fn new(
         pkg_deps: Option<AnalyzedPkgInfo>,
         edition: Option<Edition>,
-        compiler_info: Option<CompilerInfo>,
+        compiler_analysis_info: Option<CompilerAnalysisInfo>,
     ) -> Self {
         Self {
             pkg_deps,
             edition,
-            compiler_info,
+            compiler_analysis_info,
         }
     }
 
@@ -283,7 +290,7 @@ impl CachingResult {
         Self {
             pkg_deps: None,
             edition: None,
-            compiler_info: None,
+            compiler_analysis_info: None,
         }
     }
 }
@@ -291,33 +298,25 @@ impl CachingResult {
 /// Builds a package at a given path and, if successful, returns parsed AST
 /// and typed AST as well as (regardless of success) diagnostics.
 /// See `get_symbols` for explanation of what `modified_files` parameter is.
-pub fn get_compiled_pkg(
+pub fn get_compiled_pkg<F: MoveFlavor>(
     packages_info: Arc<Mutex<CachedPackages>>,
     ide_files_root: VfsPath,
     pkg_path: &Path,
     lint: LintLevel,
-    implicit_deps: Dependencies,
     flavor: Option<Flavor>,
+    cursor_file_opt: Option<&PathBuf>,
 ) -> Result<(Option<CompiledPkgInfo>, BTreeMap<PathBuf, Vec<Diagnostic>>)> {
     let cached_deps_exist = has_precompiled_deps(pkg_path, packages_info.clone());
-    let build_config = move_package::BuildConfig {
+    let build_config = move_package_alt_compilation::build_config::BuildConfig {
         test_mode: true,
         install_dir: Some(tempdir().unwrap().path().to_path_buf()),
         default_flavor: flavor,
         lint_flag: lint.into(),
         force_lock_file: cached_deps_exist,
-        skip_fetch_latest_git_deps: cached_deps_exist,
-        implicit_dependencies: implicit_deps,
         ..Default::default()
     };
 
     eprintln!("symbolicating {:?}", pkg_path);
-
-    // resolution graph diagnostics are only needed for CLI commands so ignore them by passing a
-    // vector as the writer
-    let resolution_graph =
-        build_config.resolution_graph_for_package(pkg_path, None, &mut Vec::new())?;
-    let root_pkg_name = resolution_graph.graph.root_package_name;
 
     let overlay_fs_root = VfsPath::new(OverlayFS::new(&[
         VfsPath::new(MemoryFS::new()),
@@ -338,8 +337,21 @@ pub fn get_compiled_pkg(
         None
     };
 
+    let root_pkg = load_root_pkg::<F>(&build_config, pkg_path)?;
+    let root_pkg_name = Symbol::from(root_pkg.name().to_string());
+    // the package's transitive dependencies
+    let mut dependencies: Vec<_> = root_pkg
+        .packages()
+        .into_iter()
+        .filter(|x| !x.is_root())
+        .collect();
+    let build_plan =
+        BuildPlan::create(&root_pkg, &build_config)?.set_compiler_vfs_root(overlay_fs_root.clone());
+
     // Hash dependencies so we can check if something has changed.
-    let mapped_files_data = compute_mapped_files(&resolution_graph, overlay_fs_root.clone());
+    // TODO: do we still need this?
+    let mapped_files_data =
+        compute_mapped_files(&root_pkg, &build_config, overlay_fs_root.clone())?;
     let file_paths: Arc<BTreeMap<FileHash, PathBuf>> = Arc::new(
         mapped_files_data
             .files
@@ -348,110 +360,123 @@ pub fn get_compiled_pkg(
             .map(|(fhash, fpath)| (*fhash, fpath.clone()))
             .collect(),
     );
-    let build_plan =
-        BuildPlan::create(&resolution_graph)?.set_compiler_vfs_root(overlay_fs_root.clone());
+
     let mut parsed_ast = None;
     let mut typed_ast = None;
     let mut diagnostics = None;
+    let mut compiler_analysis_info_opt = None;
+    let mut compiler_autocomplete_info_opt = None;
 
-    let compiler_flags = resolution_graph.build_options.compiler_flags().clone();
-    let mut dependencies = build_plan.compute_dependencies();
-    let (mut caching_result, other_diags) =
-        if let Ok(deps_package_paths) = dependencies.make_deps_for_compiler() {
-            // Partition deps_package according whether src is available
-            let src_deps = deps_package_paths
-                .iter()
-                .filter_map(|(p, b)| {
-                    if let ModuleFormat::Source = b {
-                        p.name.as_ref().map(|(n, _)| (*n, p.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<BTreeMap<_, _>>();
+    let compiler_flags = compiler_flags(&build_config);
+    let (mut caching_result, other_diags) = if let Ok(deps_package_paths) =
+        make_deps_for_compiler(&mut Vec::new(), dependencies.clone(), &build_config)
+    {
+        let src_deps: BTreeMap<Symbol, PackagePaths> = deps_package_paths
+            .into_iter()
+            .filter_map(|p| p.name.as_ref().map(|(n, _)| (*n, p.clone())))
+            .collect();
 
-            let mut cached_packages = packages_info.lock().unwrap();
-            // need to extract all data from pkg_info first so that we can
-            // borrow it mutably later
-            let cached_pkg_info_opt = match cached_packages.pkg_info.get(pkg_path) {
-                Some(Some(d)) => {
-                    let mut hasher = Sha256::new();
-                    d.dep_hashes.iter().for_each(|h| {
-                        hasher.update(h.0);
-                    });
-                    let deps_hash = hasher_to_hash_string(hasher);
-                    if manifest_hash.is_some()
-                        && manifest_hash == d.manifest_hash
-                        && mapped_files_data.deps_hash == deps_hash
-                    {
-                        eprintln!("found cached deps for {:?}", pkg_path);
-                        Some(d)
-                    } else {
-                        eprintln!("found invalidated cached deps for {:?}", pkg_path);
-                        None
-                    }
-                }
-                _ => {
-                    eprintln!("no cached deps for {:?}", pkg_path);
+        let mut cached_packages = packages_info.lock().unwrap();
+        // need to extract all data from pkg_info first so that we can
+        // borrow it mutably later
+        let cached_pkg_info_opt = match cached_packages.pkg_info.get(pkg_path) {
+            Some(Some(d)) => {
+                let mut hasher = Sha256::new();
+                d.dep_hashes.iter().for_each(|h| {
+                    hasher.update(h.0);
+                });
+                let deps_hash = hasher_to_hash_string(hasher);
+                if manifest_hash.is_some()
+                    && manifest_hash == d.manifest_hash
+                    && mapped_files_data.deps_hash == deps_hash
+                {
+                    eprintln!("found cached deps for {:?}", pkg_path);
+                    Some(d)
+                } else {
+                    eprintln!("found invalidated cached deps for {:?}", pkg_path);
                     None
                 }
-            };
-
-            let other_diags = cached_packages
-                .pkg_info
-                .iter()
-                .filter_map(|(p, cached_pkg_info_opt)| {
-                    if p != pkg_path {
-                        cached_pkg_info_opt.as_ref().map(|c| c.lsp_diags.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            let caching_result = match cached_pkg_info_opt {
-                Some(cached_pkg_info) => {
-                    dependencies.remove_deps(cached_pkg_info.dep_names.clone());
-                    let deps = cached_pkg_info.deps.clone();
-                    let analyzed_pkg_info = AnalyzedPkgInfo::new(
-                        deps,
-                        cached_pkg_info.dep_names.clone(),
-                        Some(cached_pkg_info.deps_symbols_data.clone()),
-                        Some(cached_pkg_info.program.clone()),
-                        cached_pkg_info.file_paths.clone(),
-                        cached_pkg_info.user_file_hashes.clone(),
-                        cached_pkg_info.dep_hashes.clone(),
-                    );
-
-                    CachingResult::new(
-                        Some(analyzed_pkg_info),
-                        cached_pkg_info.edition,
-                        cached_pkg_info.compiler_info.clone(),
-                    )
-                }
-                None => {
-                    if let Some((program_deps, dep_names)) = compute_pre_compiled_dep_data(
-                        &mut cached_packages.compiled_dep_pkgs,
-                        mapped_files_data.dep_pkg_paths,
-                        src_deps,
-                        resolution_graph.root_package(),
-                        &resolution_graph.topological_order(),
-                        compiler_flags,
-                        overlay_fs_root.clone(),
-                    ) {
-                        let analyzed_pkg_info =
-                            AnalyzedPkgInfo::new_precompiled_only(program_deps, dep_names);
-                        CachingResult::new(Some(analyzed_pkg_info), None, None)
-                    } else {
-                        CachingResult::empty()
-                    }
-                }
-            };
-
-            (caching_result, other_diags)
-        } else {
-            (CachingResult::empty(), vec![])
+            }
+            _ => {
+                eprintln!("no cached deps for {:?}", pkg_path);
+                None
+            }
         };
+
+        let other_diags = cached_packages
+            .pkg_info
+            .iter()
+            .filter_map(|(p, cached_pkg_info_opt)| {
+                if p != pkg_path {
+                    cached_pkg_info_opt.as_ref().map(|c| c.lsp_diags.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let caching_result = match cached_pkg_info_opt {
+            Some(cached_pkg_info) => {
+                // remove dependencies that are already included in the cached package info to
+                // avoid recompiling them
+                dependencies.retain(|d| {
+                    !cached_pkg_info
+                        .dep_names
+                        .contains(&Symbol::from(d.id().to_string()))
+                });
+
+                let deps = cached_pkg_info.deps.clone();
+                let analyzed_pkg_info = AnalyzedPkgInfo::new(
+                    deps,
+                    cached_pkg_info.dep_names.clone(),
+                    Some(cached_pkg_info.deps_symbols_data.clone()),
+                    Some(cached_pkg_info.program.clone()),
+                    cached_pkg_info.file_paths.clone(),
+                    cached_pkg_info.user_file_hashes.clone(),
+                    cached_pkg_info.dep_hashes.clone(),
+                );
+
+                CachingResult::new(
+                    Some(analyzed_pkg_info),
+                    cached_pkg_info.edition,
+                    cached_pkg_info.compiler_analysis_info.clone(),
+                )
+            }
+            None => {
+                // get the topologically sorted dependencies, but use the package ids instead of
+                // package names. In the new pkg system, multiple packages with the same name can
+                // exist as the package system will assign unique package ids to them, before
+                // passing them to the compiler.
+                let sorted_deps: Vec<Symbol> = root_pkg
+                    .sorted_deps_ids()
+                    .into_iter()
+                    .map(|x| Symbol::from(x.to_string()))
+                    .collect();
+                if let Some((program_deps, dep_names)) = compute_pre_compiled_dep_data(
+                    &mut cached_packages.compiled_dep_pkgs,
+                    mapped_files_data.dep_pkg_paths,
+                    src_deps,
+                    root_pkg_name,
+                    &sorted_deps,
+                    compiler_flags,
+                    overlay_fs_root.clone(),
+                ) {
+                    let analyzed_pkg_info = AnalyzedPkgInfo::new_precompiled_only(
+                        program_deps,
+                        dep_names,
+                        mapped_files_data.dep_hashes.clone(),
+                    );
+                    CachingResult::new(Some(analyzed_pkg_info), None, None)
+                } else {
+                    CachingResult::empty()
+                }
+            }
+        };
+
+        (caching_result, other_diags)
+    } else {
+        (CachingResult::empty(), vec![])
+    };
 
     let (full_compilation, files_to_compile) = if let Some(cached_info) = &caching_result.pkg_deps {
         if cached_info.program.is_some() {
@@ -477,6 +502,11 @@ pub fn get_compiled_pkg(
                 }
             }
 
+            // Add cursor file to force incremental compilation for autocomplete
+            if let Some(cursor_file) = cursor_file_opt {
+                modified_files.insert(cursor_file.clone());
+            }
+
             (false, modified_files)
         } else {
             (true, BTreeSet::new())
@@ -494,7 +524,7 @@ pub fn get_compiled_pkg(
     let mut ide_diags = lsp_empty_diagnostics(mapped_files_data.files.file_name_mapping());
     if full_compilation || !files_to_compile.is_empty() {
         build_plan.compile_with_driver_and_deps(
-            dependencies,
+            dependencies.into_iter().map(|x| x.id()).cloned().collect(),
             &mut std::io::sink(),
             |compiler| {
                 let compiler = compiler.set_ide_mode();
@@ -533,19 +563,31 @@ pub fn get_compiled_pkg(
                         let failure = true;
                         diagnostics = Some((diags, failure));
                         eprintln!("typed AST compilation failed");
-                        eprintln!("diagnostics: {:#?}", diagnostics);
                         return Ok((files, vec![]));
                     }
                 };
                 eprintln!("compiled to typed AST");
                 let (compiler, typed_program) = compiler.into_ast();
                 typed_ast = Some(typed_program.clone());
-                caching_result.compiler_info = Some(CompilerInfo::from(
-                    compiler.compilation_env().ide_information().clone(),
-                ));
+                let (analysis_info, autocomplete_info) =
+                    process_ide_annotations(compiler.compilation_env().ide_information().clone());
+                // Don't update caching_result here - will be merged in conditional below
+                compiler_analysis_info_opt = Some(analysis_info);
+
+                // Filter autocomplete info based on cursor file
+                // - If cursor_file_opt is None: no autocomplete needed, use empty info
+                // - If cursor_file_opt is Some: only keep autocomplete info for that file
+                compiler_autocomplete_info_opt = Some(if let Some(cursor_file) = cursor_file_opt {
+                    filter_autocomplete_for_file(
+                        autocomplete_info,
+                        cursor_file,
+                        mapped_files_data.files.file_name_mapping(),
+                    )
+                } else {
+                    CompilerAutocompleteInfo::new()
+                });
                 caching_result.edition =
                     Some(compiler.compilation_env().edition(Some(root_pkg_name)));
-
                 // compile to CFGIR for accurate diags
                 eprintln!("compiling to CFGIR");
                 let compilation_result = compiler.at_typing(typed_program).run::<PASS_CFGIR>();
@@ -581,14 +623,18 @@ pub fn get_compiled_pkg(
     }
     // uwrap's are safe - this function returns earlier (during diagnostics processing)
     // when failing to produce the ASTs
-    let (parsed_definitions, typed_modules) = if full_compilation {
+    let (parsed_definitions, typed_modules, compiler_analysis_info) = if full_compilation {
         let parsed_program = parsed_ast.unwrap();
         let parsed_definitions = ParsedDefinitions {
             source_definitions: parsed_program.source_definitions,
             lib_definitions: parsed_program.lib_definitions,
         };
         let typed_modules = typed_ast.unwrap().modules;
-        (parsed_definitions, typed_modules)
+        (
+            parsed_definitions,
+            typed_modules,
+            compiler_analysis_info_opt,
+        )
     } else if files_to_compile.is_empty() {
         // no compilation happened, so we get everything from the cache, and
         // the unwraps are safe because the cache is guaranteed to exist (otherwise
@@ -598,15 +644,25 @@ pub fn get_compiled_pkg(
         (
             compiled_program.parsed_definitions.clone(),
             compiled_program.typed_modules.clone(),
+            caching_result.compiler_analysis_info.clone(),
         )
     } else {
-        merge_user_programs(
+        let (parsed_defs, typed_mods) = merge_user_programs(
             caching_result.pkg_deps.clone(),
             parsed_ast.unwrap(),
             typed_ast.unwrap().modules,
-            file_paths,
-            files_to_compile,
-        )
+            file_paths.clone(),
+            files_to_compile.clone(),
+        );
+
+        let merged_analysis_info = Some(merge_compiler_analysis_info(
+            caching_result.compiler_analysis_info.clone().unwrap(),
+            compiler_analysis_info_opt.unwrap(),
+            &file_paths,
+            &files_to_compile,
+        ));
+
+        (parsed_defs, typed_mods, merged_analysis_info)
     };
 
     // There may be diagnostics from other packages that still need to be displayed
@@ -634,7 +690,8 @@ pub fn get_compiled_pkg(
         },
         mapped_files: mapped_files_data.files,
         edition: caching_result.edition,
-        compiler_info: caching_result.compiler_info,
+        compiler_analysis_info,
+        compiler_autocomplete_info: compiler_autocomplete_info_opt,
         lsp_diags: Arc::new(lsp_diags),
     };
     Ok((Some(compiled_pkg_info), ide_diags))
@@ -652,14 +709,16 @@ fn compute_pre_compiled_dep_data(
     mut dep_paths: BTreeMap<Symbol, PathBuf>,
     mut src_deps: BTreeMap<Symbol, PackagePaths>,
     root_package_name: Symbol,
-    topological_order: &[PackageName],
+    topological_order: &[Symbol],
     compiler_flags: Flags,
     vfs_root: VfsPath,
 ) -> Option<(Arc<PreCompiledProgramInfo>, BTreeSet<Symbol>)> {
     let mut pre_compiled_modules = BTreeMap::new();
     let mut pre_compiled_names = BTreeSet::new();
     for pkg_name in topological_order.iter().rev() {
-        if *pkg_name == root_package_name {
+        // both pkg_name and root_package_name are actually PackageIDs and generated by the pkg
+        // system
+        if pkg_name == &root_package_name {
             continue;
         }
         let Some(dep_path) = dep_paths.remove(pkg_name) else {
@@ -754,15 +813,19 @@ fn has_precompiled_deps(pkg_path: &Path, pkg_dependencies: Arc<Mutex<CachedPacka
     pkg_deps.pkg_info.contains_key(pkg_path)
 }
 
-fn compute_mapped_files(resolved_graph: &ResolvedGraph, overlay_fs: VfsPath) -> MappedFilesData {
+fn compute_mapped_files<F: MoveFlavor>(
+    root_pkg: &RootPackage<F>,
+    build_config: &BuildConfig,
+    overlay_fs: VfsPath,
+) -> anyhow::Result<MappedFilesData> {
     let mut mapped_files: MappedFiles = MappedFiles::empty();
     let mut hasher = Sha256::new();
     let mut dep_hashes = vec![];
     let mut dep_pkg_paths = BTreeMap::new();
 
-    for rpkg in resolved_graph.package_table.values() {
-        for f in rpkg.get_sources(&resolved_graph.build_options).unwrap() {
-            let is_dep = rpkg.package_path != resolved_graph.graph.root_path;
+    for rpkg in root_pkg.packages() {
+        for f in get_sources(rpkg.path(), build_config).unwrap() {
+            let is_dep = !rpkg.is_root();
             // dunce does a better job of canonicalization on Windows
             let fname = dunce::canonicalize(f.as_str())
                 .map(|p| p.to_string_lossy().to_string())
@@ -778,7 +841,7 @@ fn compute_mapped_files(resolved_graph: &ResolvedGraph, overlay_fs: VfsPath) -> 
             if is_dep {
                 hasher.update(fhash.0);
                 dep_hashes.push(fhash);
-                dep_pkg_paths.insert(rpkg.source_package.package.name, rpkg.package_path.clone());
+                dep_pkg_paths.insert(rpkg.id().clone().into(), rpkg.path().path().to_path_buf());
             }
             // write to top layer of the overlay file system so that the content
             // is immutable for the duration of compilation and symbolication
@@ -788,12 +851,13 @@ fn compute_mapped_files(resolved_graph: &ResolvedGraph, overlay_fs: VfsPath) -> 
             mapped_files.add(fhash, fname.into(), Arc::from(contents.into_boxed_str()));
         }
     }
-    MappedFilesData::new(
+
+    Ok(MappedFilesData::new(
         mapped_files,
         hasher_to_hash_string(hasher),
         dep_hashes,
         dep_pkg_paths,
-    )
+    ))
 }
 
 /// Helper function to convert a hasher to a hash string
@@ -894,6 +958,77 @@ fn merge_user_programs(
     (result_parsed_definitions, result_typed_modules)
 }
 
+/// Merges cached CompilerAnalysisInfo with newly compiled info during incremental compilation.
+/// Filters out entries from modified files from the cache, then adds new entries.
+fn merge_compiler_analysis_info(
+    cached_info: CompilerAnalysisInfo,
+    new_info: CompilerAnalysisInfo,
+    file_paths: &BTreeMap<FileHash, PathBuf>,
+    modified_files: &BTreeSet<PathBuf>,
+) -> CompilerAnalysisInfo {
+    let mut result = cached_info;
+
+    // Helper to check if a location is in a modified file
+    let is_modified = |loc: &Loc| -> bool {
+        file_paths
+            .get(&loc.file_hash())
+            .map(|path| modified_files.contains(path))
+            .unwrap_or(false)
+    };
+
+    // Remove entries from modified files
+    result.macro_info.retain(|loc, _| !is_modified(loc));
+    result.expanded_lambdas.retain(|loc| !is_modified(loc));
+    result.ellipsis_binders.retain(|loc| !is_modified(loc));
+
+    // Add new entries - no additional filtering needed
+    // as incremental compilation produced these
+    // only for modified files
+    result.macro_info.extend(new_info.macro_info);
+    result.expanded_lambdas.extend(new_info.expanded_lambdas);
+    result.ellipsis_binders.extend(new_info.ellipsis_binders);
+
+    result
+}
+
+/// Filters CompilerAutocompleteInfo to only include entries for the specified file.
+/// Used when cursor is in a specific file - we only need autocomplete info for that file.
+fn filter_autocomplete_for_file(
+    autocomplete_info: CompilerAutocompleteInfo,
+    cursor_file: &PathBuf,
+    file_paths: &BTreeMap<FileHash, PathBuf>,
+) -> CompilerAutocompleteInfo {
+    // Find the FileHash for the cursor file
+    let cursor_fhash = file_paths
+        .iter()
+        .find(|(_, path)| *path == cursor_file)
+        .map(|(fhash, _)| *fhash);
+
+    let Some(cursor_fhash) = cursor_fhash else {
+        // Cursor file not in mapped files - return empty
+        return CompilerAutocompleteInfo::new();
+    };
+
+    // Filter dot_autocomplete_info: keep only the cursor file's entry
+    let filtered_dot = autocomplete_info
+        .dot_autocomplete_info
+        .into_iter()
+        .filter(|(fhash, _)| *fhash == cursor_fhash)
+        .collect();
+
+    // Filter path_autocomplete_info: keep only entries whose Loc is in cursor file
+    let filtered_path = autocomplete_info
+        .path_autocomplete_info
+        .into_iter()
+        .filter(|(loc, _)| loc.file_hash() == cursor_fhash)
+        .collect();
+
+    CompilerAutocompleteInfo {
+        dot_autocomplete_info: filtered_dot,
+        path_autocomplete_info: filtered_path,
+    }
+}
+
 /// Checks if a parsed module is modified by getting
 /// the module's file path and checking if it's included
 /// in the set of modified file paths.
@@ -940,4 +1075,17 @@ fn is_parsed_pkg_modified(
             .iter()
             .any(|mdef| is_parsed_mod_modified(mdef, modified_files, file_paths.clone())),
     }
+}
+
+fn load_root_pkg<F: MoveFlavor>(
+    build_config: &BuildConfig,
+    path: &Path,
+) -> anyhow::Result<RootPackage<F>> {
+    let env = find_env::<F>(path, build_config)?;
+    let mut root_pkg =
+        RootPackage::<F>::load_sync(path.to_path_buf(), env, build_config.mode_set())?;
+
+    root_pkg.save_lockfile_to_disk()?;
+
+    Ok(root_pkg)
 }

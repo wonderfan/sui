@@ -21,9 +21,6 @@ const PIPELINE_BUFFER: usize = 5;
 /// happen if the pipeline was started with its initial checkpoint overridden to be strictly
 /// greater than its current watermark -- in that case, the pipeline will never be able to update
 /// its watermarks.
-///
-/// This may be a legitimate thing to do when backfilling a table, but in that case
-/// `--skip-watermarks` should be used.
 const WARN_PENDING_WATERMARKS: usize = 10000;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -56,17 +53,6 @@ struct WatermarkPart {
     batch_rows: usize,
     /// The total number of rows from this watermark
     total_rows: usize,
-}
-
-/// Internal type used by workers to propagate errors or shutdown signals up to their
-/// supervisor.
-#[derive(thiserror::Error, Debug)]
-enum Break {
-    #[error("Shutdown received")]
-    Cancel,
-
-    #[error(transparent)]
-    Err(#[from] anyhow::Error),
 }
 
 impl CommitterConfig {

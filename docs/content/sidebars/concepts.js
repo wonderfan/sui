@@ -6,20 +6,45 @@ const concepts = [
 	'concepts/sui-for-ethereum',
 	{
 		type: 'category',
-		label: 'Sui Architecture',
+		label: 'Architecture',
 		link: {
 			type: 'doc',
-			id: 'concepts/components',
+			id: 'concepts/architecture',
 		},
 		items: [
 			'concepts/sui-architecture/networks',
-			'concepts/sui-architecture/consensus',
 			'concepts/sui-architecture/sui-storage',
-			'concepts/sui-architecture/sui-security',
+			'concepts/sui-architecture/consensus',
 			'concepts/sui-architecture/epochs',
-			'concepts/sui-architecture/indexer-functions',
+			'concepts/sui-architecture/sui-security',
 			'concepts/sui-architecture/protocol-upgrades',
-			'concepts/sui-architecture/data-management-things',
+		],
+	},
+	{
+		type: 'category',
+		label: 'Transactions',
+		link: {
+			type: 'doc',
+			id: 'concepts/transactions',
+		},
+		items: [
+			'concepts/transactions/transaction-lifecycle',
+			'concepts/transactions/prog-txn-blocks',
+			'concepts/transactions/sponsored-transactions',
+			'concepts/transactions/gas-smashing',
+			{
+				type: 'category',
+				label: 'Transaction Authentication',
+				link: {
+					type: 'doc',
+					id: 'concepts/transactions/transaction-auth',
+				},
+				items: [
+					'concepts/transactions/transaction-auth/multisig',
+					'concepts/transactions/transaction-auth/offline-signing',
+					'concepts/transactions/transaction-auth/intent-signing',
+				],
+			},
 		],
 	},
 	{
@@ -33,76 +58,6 @@ const concepts = [
 			'concepts/tokenomics/staking-unstaking',
 			'concepts/tokenomics/sui-bridging',
 			'concepts/tokenomics/gas-in-sui',
-			'concepts/tokenomics/vesting-strategies',
-			'concepts/sui-architecture/staking-rewards',
-		],
-	},
-	{
-		type: 'category',
-		label: 'Transactions',
-		link: {
-			type: 'doc',
-			id: 'concepts/transactions',
-		},
-		items: [
-			'concepts/sui-architecture/transaction-lifecycle',
-			'concepts/transactions/prog-txn-blocks',
-			'concepts/transactions/sponsored-transactions',
-			'concepts/transactions/gas-smashing',
-			{
-				type: 'category',
-				label: 'Transaction Authentication',
-				link: {
-					type: 'doc',
-					id: 'concepts/cryptography/transaction-auth',
-				},
-				items: [
-					'concepts/cryptography/transaction-auth/keys-addresses',
-					'concepts/cryptography/transaction-auth/signatures',
-					'concepts/cryptography/transaction-auth/multisig',
-					'concepts/cryptography/transaction-auth/offline-signing',
-					'concepts/cryptography/transaction-auth/intent-signing',
-				],
-			},
-		],
-	},
-	{
-		type: 'category',
-		label: 'Object Model',
-		link: {
-			type: 'doc',
-			id: 'concepts/object-model',
-		},
-		items: [
-			{
-				type: 'category',
-				label: 'Object Ownership',
-				link: {
-					type: 'doc',
-					id: 'concepts/object-ownership',
-				},
-				items: [
-					'concepts/object-ownership/address-owned',
-					'concepts/object-ownership/immutable',
-					'concepts/object-ownership/party',
-					'concepts/object-ownership/shared',
-					'concepts/object-ownership/wrapped',
-				],
-			},
-			{
-				type: 'category',
-				label: 'Transfers',
-				link: {
-					type: 'doc',
-					id: 'concepts/transfers',
-				},
-				items: [
-					'concepts/transfers/custom-rules',
-					'concepts/transfers/transfer-policies',
-					'concepts/transfers/transfer-to-object',
-				],
-			},
-			'concepts/versioning',
 		],
 	},
 	{
@@ -142,22 +97,26 @@ const concepts = [
 	{
 		type: 'category',
 		label: 'Data Access',
+		link: {
+			type: 'doc',
+			id: 'concepts/data-access/data-serving',
+		},
 		items: [
-			'concepts/grpc-overview',
+			'concepts/data-access/grpc-overview',
 			{
 				type: 'category',
 				label: 'GraphQL and Indexer Framework',
 				link: {
 					type: 'doc',
-					id: 'concepts/graphql-indexer',
+					id: 'concepts/data-access/graphql-indexer',
 				},
 				items: [
-					'concepts/graphql-rpc',
-					'concepts/custom-indexing-framework',
-					'concepts/custom-indexer/pipeline-architecture',
+					'concepts/data-access/graphql-rpc',
+					'concepts/data-access/custom-indexing-framework',
+					'concepts/data-access/pipeline-architecture',
 				],
 			},
-			'concepts/archival-store',
+			'concepts/data-access/archival-store',
 		],
 	},
 	{

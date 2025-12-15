@@ -15,6 +15,7 @@ use diesel_async::RunQueryDsl;
 use reqwest::Client;
 use serde_json::{Value, json};
 use simulacrum::Simulacrum;
+use sui_futures::service::Service;
 use sui_indexer_alt::{BootstrapGenesis, config::IndexerConfig, setup_indexer};
 use sui_indexer_alt_consistent_api::proto::rpc::consistent::v1alpha::{
     AvailableRangeRequest, consistent_service_client::ConsistentServiceClient,
@@ -23,9 +24,14 @@ use sui_indexer_alt_consistent_store::{
     args::RpcArgs as ConsistentArgs, args::TlsArgs as ConsistentTlsArgs,
     config::ServiceConfig as ConsistentConfig, start_service as start_consistent_store,
 };
-use sui_indexer_alt_framework::{IndexerArgs, ingestion::ClientArgs, postgres::schema::watermarks};
+use sui_indexer_alt_framework::{
+    IndexerArgs,
+    ingestion::{ClientArgs, ingestion_client::IngestionClientArgs},
+    postgres::schema::watermarks,
+};
 use sui_indexer_alt_graphql::{
-    RpcArgs as GraphQlArgs, config::RpcConfig as GraphQlConfig, start_rpc as start_graphql,
+    RpcArgs as GraphQlArgs, args::KvArgs as GraphQlKvArgs, config::RpcConfig as GraphQlConfig,
+    start_rpc as start_graphql,
 };
 use sui_indexer_alt_jsonrpc::{
     NodeArgs as JsonRpcNodeArgs, RpcArgs as JsonRpcArgs, config::RpcConfig as JsonRpcConfig,
@@ -51,11 +57,9 @@ use sui_types::{
 };
 use tempfile::TempDir;
 use tokio::{
-    task::JoinHandle,
     time::{error::Elapsed, interval},
     try_join,
 };
-use tokio_util::sync::CancellationToken;
 use url::Url;
 
 pub mod coin_registry;
@@ -99,21 +103,10 @@ pub struct OffchainCluster {
     /// The pipelines that the indexer is populating.
     pipelines: Vec<&'static str>,
 
-    /// A handle to the indexer task -- it will stop when the `cancel` token is triggered (or
-    /// earlier of its own accord).
-    indexer: JoinHandle<()>,
-
-    /// A handle to the consistent store task -- it will stop when the `cancel` token is triggered
-    /// (or earlier of its own accord).
-    consistent_store: JoinHandle<()>,
-
-    /// A handle to the JSON-RPC server task -- it will stop when the `cancel` token is triggered
-    /// (or earlier of its own accord).
-    jsonrpc: JoinHandle<()>,
-
-    /// A handle to the GraphQL server task -- it will stop when the `cancel` token is triggered
-    /// (or earlier of its own accord).
-    graphql: JoinHandle<()>,
+    /// Handles to all running services. Held on to so the services are not dropped (and therefore
+    /// aborted) until the cluster is stopped.
+    #[allow(unused)]
+    services: Service,
 
     /// Hold on to the database so it doesn't get dropped until the cluster is stopped.
     #[allow(unused)]
@@ -123,9 +116,6 @@ pub struct OffchainCluster {
     /// doesn't get cleaned up until the cluster is stopped.
     #[allow(unused)]
     dir: TempDir,
-
-    /// This token controls the clean up of the cluster.
-    cancel: CancellationToken,
 }
 
 pub struct OffchainClusterConfig {
@@ -147,7 +137,6 @@ impl FullCluster {
             Simulacrum::new(),
             OffchainClusterConfig::default(),
             &prometheus::Registry::new(),
-            CancellationToken::new(),
         )
         .await
     }
@@ -159,12 +148,11 @@ impl FullCluster {
         mut executor: Simulacrum,
         offchain_cluster_config: OffchainClusterConfig,
         registry: &prometheus::Registry,
-        cancel: CancellationToken,
     ) -> anyhow::Result<Self> {
         let (client_args, temp_dir) = local_ingestion_client_args();
         executor.set_data_ingestion_path(temp_dir.path().to_owned());
 
-        let offchain = OffchainCluster::new(client_args, offchain_cluster_config, registry, cancel)
+        let offchain = OffchainCluster::new(client_args, offchain_cluster_config, registry)
             .await
             .context("Failed to create off-chain cluster")?;
 
@@ -291,12 +279,6 @@ impl FullCluster {
     ) -> Result<(), Elapsed> {
         self.offchain.wait_for_graphql(checkpoint, timeout).await
     }
-
-    /// Triggers cancellation of all downstream services, waits for them to stop, cleans up the
-    /// temporary database, and the temporary directory used for ingestion.
-    pub async fn stopped(self) {
-        self.offchain.stopped().await;
-    }
 }
 
 impl OffchainCluster {
@@ -320,7 +302,6 @@ impl OffchainCluster {
             bootstrap_genesis,
         }: OffchainClusterConfig,
         registry: &prometheus::Registry,
-        cancel: CancellationToken,
     ) -> anyhow::Result<Self> {
         let consistent_port = get_available_port();
         let consistent_listen_address =
@@ -365,7 +346,6 @@ impl OffchainCluster {
             indexer_config,
             bootstrap_genesis,
             registry,
-            cancel.child_token(),
         )
         .await
         .context("Failed to setup indexer")?;
@@ -381,7 +361,6 @@ impl OffchainCluster {
             "0.0.0",
             consistent_config,
             registry,
-            cancel.child_token(),
         )
         .await
         .context("Failed to start Consistent Store")?;
@@ -396,7 +375,6 @@ impl OffchainCluster {
             SystemPackageTaskArgs::default(),
             jsonrpc_config,
             registry,
-            cancel.child_token(),
         )
         .await
         .context("Failed to start JSON-RPC server")?;
@@ -410,10 +388,9 @@ impl OffchainCluster {
 
         let graphql = start_graphql(
             Some(database_url.clone()),
-            None,
             fullnode_args,
             DbArgs::default(),
-            BigtableArgs::default(),
+            GraphQlKvArgs::default(),
             consistent_reader_args,
             graphql_args,
             SystemPackageTaskArgs::default(),
@@ -421,10 +398,14 @@ impl OffchainCluster {
             graphql_config,
             pipelines.iter().map(|p| p.to_string()).collect(),
             registry,
-            cancel.child_token(),
         )
         .await
         .context("Failed to start GraphQL server")?;
+
+        let services = indexer
+            .merge(consistent_store)
+            .merge(jsonrpc)
+            .merge(graphql);
 
         Ok(Self {
             consistent_listen_address,
@@ -432,13 +413,9 @@ impl OffchainCluster {
             graphql_listen_address,
             db,
             pipelines,
-            indexer,
-            consistent_store,
-            jsonrpc,
-            graphql,
+            services,
             database,
             dir,
-            cancel,
         })
     }
 
@@ -660,16 +637,6 @@ impl OffchainCluster {
         })
         .await
     }
-
-    /// Triggers cancellation of all downstream services, waits for them to stop, and cleans up the
-    /// temporary database.
-    pub async fn stopped(self) {
-        self.cancel.cancel();
-        let _ = self.indexer.await;
-        let _ = self.consistent_store.await;
-        let _ = self.jsonrpc.await;
-        let _ = self.graphql.await;
-    }
 }
 
 impl Default for OffchainClusterConfig {
@@ -693,7 +660,10 @@ pub fn local_ingestion_client_args() -> (ClientArgs, TempDir) {
         .context("Failed to create data ingestion path")
         .unwrap();
     let client_args = ClientArgs {
-        local_ingestion_path: Some(temp_dir.path().to_owned()),
+        ingestion: IngestionClientArgs {
+            local_ingestion_path: Some(temp_dir.path().to_owned()),
+            ..Default::default()
+        },
         ..Default::default()
     };
     (client_args, temp_dir)

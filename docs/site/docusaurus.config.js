@@ -43,9 +43,6 @@ const config = {
   // Set the /<baseUrl>/ pathname under which your site is served
   // For GitHub pages deployment, it is often '/<projectName>/'
   baseUrl: "/",
-  customFields: {
-    amplitudeKey: process.env.AMPLITUDE_KEY,
-  },
 
   onBrokenLinks: "throw",
   onBrokenMarkdownLinks: "throw",
@@ -57,6 +54,7 @@ const config = {
   clientModules: [require.resolve("./src/client/pushfeedback-toc.js")],
   plugins: [
     //require.resolve('./src/plugins/framework'),
+    "docusaurus-plugin-copy-page-button",
     [
       require.resolve("./src/plugins/plausible"),
       {
@@ -162,7 +160,6 @@ const config = {
           exclude: [
             "**/snippets/**",
             "**/standards/deepbook-ref/**",
-            "**/submodules/**",
             "**/app-examples/ts-sdk-ref/**",
           ],
           admonitions: {

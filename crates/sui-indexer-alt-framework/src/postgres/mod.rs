@@ -7,12 +7,11 @@ use prometheus::Registry;
 use sui_indexer_alt_metrics::db::DbConnectionStatsCollector;
 use sui_pg_db::temp::TempDb;
 use tempfile::tempdir;
-use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
     Indexer, IndexerArgs,
-    ingestion::{ClientArgs, IngestionConfig},
+    ingestion::{ClientArgs, IngestionConfig, ingestion_client::IngestionClientArgs},
 };
 
 pub use sui_pg_db::*;
@@ -46,7 +45,6 @@ impl Indexer<Db> {
         migrations: Option<&'static EmbeddedMigrations>,
         metrics_prefix: Option<&str>,
         registry: &Registry,
-        cancel: CancellationToken,
     ) -> Result<Self> {
         let store = Db::for_write(database_url, db_args) // I guess our store needs a constructor fn
             .await
@@ -70,7 +68,6 @@ impl Indexer<Db> {
             ingestion_config,
             metrics_prefix,
             registry,
-            cancel,
         )
         .await
     }
@@ -89,13 +86,15 @@ impl Indexer<Db> {
             store,
             IndexerArgs::default(),
             ClientArgs {
-                local_ingestion_path: Some(tempdir().unwrap().keep()),
+                ingestion: IngestionClientArgs {
+                    local_ingestion_path: Some(tempdir().unwrap().keep()),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             IngestionConfig::default(),
             None,
             &Registry::new(),
-            CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -157,7 +156,7 @@ pub mod tests {
             .concurrent_pipeline(ConcurrentPipeline1, ConcurrentConfig::default())
             .await
             .unwrap();
-        assert_eq!(indexer.first_checkpoint_from_watermark, 0);
+        assert_eq!(indexer.first_ingestion_checkpoint, 0);
     }
 
     #[tokio::test]
@@ -176,7 +175,7 @@ pub mod tests {
             .concurrent_pipeline(ConcurrentPipeline1, ConcurrentConfig::default())
             .await
             .unwrap();
-        assert_eq!(indexer.first_checkpoint_from_watermark, 11);
+        assert_eq!(indexer.first_ingestion_checkpoint, 11);
     }
 
     #[tokio::test]
@@ -202,11 +201,11 @@ pub mod tests {
             .concurrent_pipeline(ConcurrentPipeline2, ConcurrentConfig::default())
             .await
             .unwrap();
-        assert_eq!(indexer.first_checkpoint_from_watermark, 21);
+        assert_eq!(indexer.first_ingestion_checkpoint, 21);
         indexer
             .concurrent_pipeline(ConcurrentPipeline1, ConcurrentConfig::default())
             .await
             .unwrap();
-        assert_eq!(indexer.first_checkpoint_from_watermark, 11);
+        assert_eq!(indexer.first_ingestion_checkpoint, 11);
     }
 }
